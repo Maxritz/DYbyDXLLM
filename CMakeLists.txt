@@ -32,26 +32,30 @@ target_include_directories(DirectLLM.Core PRIVATE
     include
     ${DIRECTSTORAGE_DIR}/native/include
     ${DXC_DIR}/inc
+    ${OPENVINO_INCLUDE_DIR}
 )
 target_link_directories(DirectLLM.Core PRIVATE
     ${DIRECTSTORAGE_DIR}/native/lib/x64
     ${DXC_DIR}/lib/x64
+    ${OPENVINO_LIB_DIR}
 )
-target_link_libraries(DirectLLM.Core PRIVATE d3d12 dxgi d3dcompiler dstorage dxcompiler)
+target_link_libraries(DirectLLM.Core PRIVATE d3d12 dxgi d3dcompiler dstorage dxcompiler openvino)
 
 add_executable(DybyDx cli/main.cpp ${SOURCES})
 target_include_directories(DybyDx PRIVATE
     include
     ${DIRECTSTORAGE_DIR}/native/include
     ${DXC_DIR}/inc
+    ${OPENVINO_INCLUDE_DIR}
 )
 target_link_directories(DybyDx PRIVATE
     ${DIRECTSTORAGE_DIR}/native/lib/x64
     ${DXC_DIR}/lib/x64
+    ${OPENVINO_LIB_DIR}
 )
-target_link_libraries(DybyDx PRIVATE d3d12 dxgi d3dcompiler dstorage dxcompiler)
+target_link_libraries(DybyDx PRIVATE d3d12 dxgi d3dcompiler dstorage dxcompiler openvino)
 
-# Post-build: copy shaders and DirectStorage DLLs
+# Post-build: copy shaders, DirectStorage, and OpenVINO DLLs
 foreach(TGT DirectLLM.Core DybyDx)
     add_custom_command(TARGET ${TGT} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -73,6 +77,12 @@ foreach(TGT DirectLLM.Core DybyDx)
             "${DXC_DIR}/bin/x64/dxcompiler.dll"
             "$<TARGET_FILE_DIR:${TGT}>/dxcompiler.dll"
         COMMENT "Copying DXC compiler DLL to ${TGT}..."
+    )
+    add_custom_command(TARGET ${TGT} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "C:/Users/rina0423/Desktop/DX/openvino/runtime/bin/intel64/Release"
+            "$<TARGET_FILE_DIR:${TGT}>"
+        COMMENT "Copying OpenVINO runtime DLLs to ${TGT}..."
     )
 endforeach()
 
