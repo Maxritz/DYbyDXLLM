@@ -1,23 +1,39 @@
 // DirectLLM C++ Core - (C) 2026 DirectLLM Team
 #include "dybydx/core/AdvancedVendorOptimizations.h"
 #include <iostream>
+#include <cmath>
+#include <cstring>
+#include <vector>
 
 namespace DirectLLM {
 
     AdvancedVendorOptimizations::AdvancedVendorOptimizations() {}
 
     AdvancedVendorOptimizations::~AdvancedVendorOptimizations() {
-        if (m_cudaContextHandle) {
-            // Unload dynamic CUDA modules if active
-        }
+        m_attnPSO.Reset();
+        m_attnRootSignature.Reset();
+        m_moePSO.Reset();
+        m_moeRootSignature.Reset();
+        m_tqPSO.Reset();
+        m_tqRootSignature.Reset();
     }
 
-    bool AdvancedVendorOptimizations::Initialize(ID3D12Device* device, const OffloadConfig& offloadConfig) {
-        m_device = device;
+    bool AdvancedVendorOptimizations::Initialize(DirectXEngine* dxEngine, const OffloadConfig& offloadConfig) {
+        m_dxEngine = dxEngine;
         m_config = offloadConfig;
+        if (m_dxEngine) {
+            m_device = m_dxEngine->GetDevice();
+        }
 
         DetectHardwarePipeline();
         LogOptimizationSpecs();
+
+        if (m_dxEngine && m_device) {
+            if (!CompileAndBuildPipelines()) {
+                std::cerr << "[AdvancedOptimizations] Failed to compile and build TurboKernels pipelines via DXC." << std::endl;
+                return false;
+            }
+        }
 
         return true;
     }
@@ -25,15 +41,141 @@ namespace DirectLLM {
     void AdvancedVendorOptimizations::DetectHardwarePipeline() {
         if (!m_device) return;
 
-        // Fetch D3D12 architecture details to configure target microarchitecture optimizations
         D3D12_FEATURE_DATA_ARCHITECTURE arch = {};
         if (SUCCEEDED(m_device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &arch, sizeof(arch)))) {
-            // Vendor identification bypass
-            // AMD PCIe adapters
-            m_activePipeline = OptimizationPipelineType::AMDRDNA_Wave32;
+            m_activePipeline = OptimizationPipelineType::StandardD3D12Compute;
         } else {
             m_activePipeline = OptimizationPipelineType::StandardD3D12Compute;
         }
+    }
+
+    bool AdvancedVendorOptimizations::CompileAndBuildPipelines() {
+        if (!m_dxEngine) return false;
+
+        ComPtr<ID3DBlob> dflashBlob;
+        ComPtr<ID3DBlob> dsparkBlob;
+        ComPtr<ID3DBlob> tqBlob;
+
+        std::wstring shaderPath = L"shaders/TurboKernels.hlsl";
+
+        // Compile compute shaders using the DXC SM6 pipeline (built-in to DirectXEngine)
+        if (!m_dxEngine->CompileComputeShader(shaderPath, "FusedFlashAttentionKernel", &dflashBlob)) return false;
+        if (!m_dxEngine->CompileComputeShader(shaderPath, "SparseMoERoutingKernel", &dsparkBlob)) return false;
+        if (!m_dxEngine->CompileComputeShader(shaderPath, "TurboQuantDequantKernel", &tqBlob)) return false;
+
+        // 1. FLASH ATTENTION PIPELINE
+        {
+            D3D12_ROOT_PARAMETER rootParams[5] = {};
+            // CBV (attnConfig)
+            rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            rootParams[0].Constants.ShaderRegister = 0;
+            rootParams[0].Constants.Num32BitValues = 5;
+            rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // SRVs (QueryBuffer, KeyBuffer, ValueBuffer)
+            for (int i = 1; i <= 3; i++) {
+                rootParams[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+                rootParams[i].Descriptor.ShaderRegister = (UINT)(i - 1);
+                rootParams[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            }
+            // UAV (AttnOutput)
+            rootParams[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rootParams[4].Descriptor.ShaderRegister = 0;
+            rootParams[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
+            rootSigDesc.NumParameters = 5;
+            rootSigDesc.pParameters = rootParams;
+            rootSigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+            ComPtr<ID3DBlob> sig, err;
+            if (FAILED(D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) return false;
+            if (FAILED(m_device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&m_attnRootSignature)))) return false;
+
+            D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+            psoDesc.pRootSignature = m_attnRootSignature.Get();
+            psoDesc.CS = { dflashBlob->GetBufferPointer(), dflashBlob->GetBufferSize() };
+            if (FAILED(m_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&m_attnPSO)))) return false;
+        }
+
+        // 2. MOE ROUTING PIPELINE
+        {
+            D3D12_ROOT_PARAMETER rootParams[5] = {};
+            // CBV (moeConfig)
+            rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            rootParams[0].Constants.ShaderRegister = 1;
+            rootParams[0].Constants.Num32BitValues = 4;
+            rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // SRVs (HiddenStates, GateWeights)
+            rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rootParams[1].Descriptor.ShaderRegister = 3;
+            rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            rootParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rootParams[2].Descriptor.ShaderRegister = 4;
+            rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // UAVs (ExpertIds, ExpertWeights)
+            rootParams[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rootParams[3].Descriptor.ShaderRegister = 1;
+            rootParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            rootParams[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rootParams[4].Descriptor.ShaderRegister = 2;
+            rootParams[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
+            rootSigDesc.NumParameters = 5;
+            rootSigDesc.pParameters = rootParams;
+            rootSigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+            ComPtr<ID3DBlob> sig, err;
+            if (FAILED(D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) return false;
+            if (FAILED(m_device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&m_moeRootSignature)))) return false;
+
+            D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+            psoDesc.pRootSignature = m_moeRootSignature.Get();
+            psoDesc.CS = { dsparkBlob->GetBufferPointer(), dsparkBlob->GetBufferSize() };
+            if (FAILED(m_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&m_moePSO)))) return false;
+        }
+
+        // 3. TURBO QUANT DEQUANT PIPELINE
+        {
+            D3D12_ROOT_PARAMETER rootParams[5] = {};
+            // CBV (tqConst)
+            rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            rootParams[0].Constants.ShaderRegister = 2;
+            rootParams[0].Constants.Num32BitValues = 3;
+            rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // SRVs (TQ_PackedWeights, TQ_Scales, TQ_ZeroPoints)
+            for (int i = 1; i <= 3; i++) {
+                rootParams[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+                rootParams[i].Descriptor.ShaderRegister = (UINT)(i + 4); // t5, t6, t7
+                rootParams[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            }
+            // UAV (TQ_Output)
+            rootParams[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rootParams[4].Descriptor.ShaderRegister = 3; // u3
+            rootParams[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
+            rootSigDesc.NumParameters = 5;
+            rootSigDesc.pParameters = rootParams;
+            rootSigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+            ComPtr<ID3DBlob> sig, err;
+            if (FAILED(D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) return false;
+            if (FAILED(m_device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&m_tqRootSignature)))) return false;
+
+            D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+            psoDesc.pRootSignature = m_tqRootSignature.Get();
+            psoDesc.CS = { tqBlob->GetBufferPointer(), tqBlob->GetBufferSize() };
+            if (FAILED(m_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&m_tqPSO)))) return false;
+        }
+
+        return true;
     }
 
     bool AdvancedVendorOptimizations::DispatchFusedAttention(ID3D12GraphicsCommandList* cmdList,
@@ -45,34 +187,115 @@ namespace DirectLLM {
                                                             uint32_t numHeads,
                                                             uint32_t headDim,
                                                             uint32_t seqLen) {
-        std::cout << "[AdvancedOptimizations] Fused Attention (dflash/FlashAttention layout) submitted on Compute Queue." << std::endl;
-        std::cout << "[dflash] Thread occupancy optimized for Wave32 instruction tiles. Thread count: " 
-                  << (seqLen * numHeads) << " active GPU grid lanes." << std::endl;
+        if (!cmdList || !query || !key || !value || !output) return false;
+        if (!m_attnPSO || !m_attnRootSignature) return false;
+
+        cmdList->SetComputeRootSignature(m_attnRootSignature.Get());
+        cmdList->SetPipelineState(m_attnPSO.Get());
+
+        struct {
+            uint32_t  BatchSize;
+            uint32_t  NumHeads;
+            uint32_t  HeadDim;
+            uint32_t  SeqLen;
+            float     InvSqrtD;
+        } constants;
+        constants.BatchSize = batchSize;
+        constants.NumHeads = numHeads;
+        constants.HeadDim = headDim;
+        constants.SeqLen = seqLen;
+        constants.InvSqrtD = 1.0f / std::sqrt((float)headDim);
+
+        cmdList->SetComputeRoot32BitConstants(0, 5, &constants, 0);
+        cmdList->SetComputeRootShaderResourceView(1, query->GetGPUVirtualAddress());
+        cmdList->SetComputeRootShaderResourceView(2, key->GetGPUVirtualAddress());
+        cmdList->SetComputeRootShaderResourceView(3, value->GetGPUVirtualAddress());
+        cmdList->SetComputeRootUnorderedAccessView(4, output->GetGPUVirtualAddress());
+
+        cmdList->Dispatch(seqLen, numHeads, batchSize);
+
         return true;
     }
 
     bool AdvancedVendorOptimizations::DispatchMoEExpertLayers(ID3D12GraphicsCommandList* cmdList,
-                                                             ID3D12Resource* inputTokens,
-                                                             const std::vector<ID3D12Resource*>& gpuExperts,
-                                                             const std::vector<void*>& cpuHostExpertsMemory) {
-        std::cout << "[AdvancedOptimizations] Sparsified Mixture of Experts (MoE) dispatching active tokens..." << std::endl;
-        
-        if (m_config.EnableSystemRamOffload) {
-            std::cout << "[SystemOffload][PCI-e] Offloaded " << (m_config.SystemRamOffloadPercent * 100) 
-                      << "% of expert weights to CPU System memory." << std::endl;
-            std::cout << "[SystemOffload] Asynchronous staging buffers uploading active experts " 
-                      << m_config.ActiveExperts << " on the Copy Queue." << std::endl;
-        }
+                                                             ID3D12Resource* hiddenStates,
+                                                             ID3D12Resource* gateWeights,
+                                                             ID3D12Resource* expertIds,
+                                                             ID3D12Resource* expertWeights,
+                                                             uint32_t numTokens,
+                                                             uint32_t numExperts,
+                                                             uint32_t activeK,
+                                                             uint32_t hiddenDim) {
+        if (!cmdList || !hiddenStates || !gateWeights || !expertIds || !expertWeights) return false;
+        if (!m_moePSO || !m_moeRootSignature) return false;
 
-        std::cout << "[dspark] Dynamically routed active expert matrices inside GPU memory grid. Latency: 4.80ms" << std::endl;
+        cmdList->SetComputeRootSignature(m_moeRootSignature.Get());
+        cmdList->SetPipelineState(m_moePSO.Get());
+
+        struct {
+            uint32_t NumTokens;
+            uint32_t NumExperts;
+            uint32_t ActiveK;
+            uint32_t HiddenDim;
+        } constants;
+        constants.NumTokens = numTokens;
+        constants.NumExperts = numExperts;
+        constants.ActiveK = activeK;
+        constants.HiddenDim = hiddenDim;
+
+        cmdList->SetComputeRoot32BitConstants(0, 4, &constants, 0);
+        cmdList->SetComputeRootShaderResourceView(1, hiddenStates->GetGPUVirtualAddress());
+        cmdList->SetComputeRootShaderResourceView(2, gateWeights->GetGPUVirtualAddress());
+        cmdList->SetComputeRootUnorderedAccessView(3, expertIds->GetGPUVirtualAddress());
+        cmdList->SetComputeRootUnorderedAccessView(4, expertWeights->GetGPUVirtualAddress());
+
+        cmdList->Dispatch(numTokens, 1, 1);
+
+        return true;
+    }
+
+    bool AdvancedVendorOptimizations::DispatchTurboQuantDequant(ID3D12GraphicsCommandList* cmdList,
+                                                               ID3D12Resource* packedWeights,
+                                                               ID3D12Resource* scales,
+                                                               ID3D12Resource* zeroPoints,
+                                                               ID3D12Resource* output,
+                                                               uint32_t numRows,
+                                                               uint32_t numCols,
+                                                               uint32_t groupSize) {
+        if (!cmdList || !packedWeights || !scales || !zeroPoints || !output) return false;
+        if (!m_tqPSO || !m_tqRootSignature) return false;
+
+        cmdList->SetComputeRootSignature(m_tqRootSignature.Get());
+        cmdList->SetPipelineState(m_tqPSO.Get());
+
+        struct {
+            uint32_t NumRows;
+            uint32_t NumCols;
+            uint32_t GroupSize;
+        } constants;
+        constants.NumRows = numRows;
+        constants.NumCols = numCols;
+        constants.GroupSize = groupSize;
+
+        cmdList->SetComputeRoot32BitConstants(0, 3, &constants, 0);
+        cmdList->SetComputeRootShaderResourceView(1, packedWeights->GetGPUVirtualAddress());
+        cmdList->SetComputeRootShaderResourceView(2, scales->GetGPUVirtualAddress());
+        cmdList->SetComputeRootShaderResourceView(3, zeroPoints->GetGPUVirtualAddress());
+        cmdList->SetComputeRootUnorderedAccessView(4, output->GetGPUVirtualAddress());
+
+        uint32_t totalWeights = numRows * numCols;
+        uint32_t totalPacked = (totalWeights + 7) / 8;
+        uint32_t groups = (totalPacked + 63) / 64;
+        cmdList->Dispatch(groups, 1, 1);
+
         return true;
     }
 
     void AdvancedVendorOptimizations::LogOptimizationSpecs() {
         std::cout << "[Optimizations] Registered pipelines:" << std::endl;
-        std::cout << "  - dflash (Fused Attention registers loading)" << std::endl;
-        std::cout << "  - dspark (Dynamic sparse expert routers)" << std::endl;
-        std::cout << "  - turboquant (Register-level bit-shifting block decompressions)" << std::endl;
+        std::cout << "  - dflash (Fused Attention registers loading CS)" << std::endl;
+        std::cout << "  - dspark (Dynamic sparse expert routers CS)" << std::endl;
+        std::cout << "  - turboquant (Register-level bit-shifting block decompressions CS)" << std::endl;
         
         switch (m_activePipeline) {
             case OptimizationPipelineType::AMDRDNA_Wave32:

@@ -4,6 +4,9 @@ project(DybyDx VERSION 1.0.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+add_compile_definitions(NOMINMAX)
+
+
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
@@ -20,8 +23,8 @@ if(MSVC)
         /Oi           # Intrinsic functions
         /Ot           # Favour speed over size
         /fp:fast      # Fast floating-point (allows reassociation, reciprocals)
-        /arch:AVX512  # Enable AVX-512F/VL/BW/DQ intrinsic headers
-                      # Actual AVX-512 code is runtime-gated via CPUID + XCR0
+        /arch:AVX2    # Enable AVX2 intrinsic headers
+                      # Actual AVX2 code is runtime-gated via CPUID + XCR0
     )
 else()
     add_compile_options(-O3 -march=native -ffast-math)
@@ -102,7 +105,10 @@ foreach(TGT DirectLLM.Core DybyDx)
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "C:/Users/rina0423/Desktop/DX/openvino/runtime/bin/intel64/Release"
             "$<TARGET_FILE_DIR:${TGT}>"
-        COMMENT "Copying OpenVINO runtime DLLs to ${TGT}..."
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "C:/Users/rina0423/Desktop/DX/openvino/runtime/3rdparty/tbb/bin/tbb12.dll"
+            "$<TARGET_FILE_DIR:${TGT}>/tbb12.dll"
+        COMMENT "Copying OpenVINO runtime DLLs and TBB to ${TGT}..."
     )
 endforeach()
 

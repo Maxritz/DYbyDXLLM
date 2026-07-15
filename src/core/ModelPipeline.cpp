@@ -1,3 +1,4 @@
+// DirectLLM C++ Core - (C) 2026 DirectLLM Team
 #include "dybydx/core/ModelPipeline.h"
 #include "dybydx/core/GgufLoader.h"
 #include "dybydx/core/DirectStorageLoader.h"
@@ -10,13 +11,42 @@
 #include <algorithm>
 #include <thread>
 #include <vector>
+#include <fstream>
 
-// SIMD intrinsics — included unconditionally; individual paths
-// are gated at BOTH compile-time (#ifdef) and runtime (m_has*).
+// SIMD intrinsics
 #include <intrin.h>      // __cpuid / __cpuidex / _xgetbv  (MSVC)
 #include <immintrin.h>   // AVX / AVX2 / AVX-512 intrinsics
 
 namespace DirectLLM {
+
+    // ================================================================
+    //  Half-precision (Float16) conversion helper
+    // ================================================================
+    static float FP16ToFloat(uint16_t h) {
+        union { uint32_t u; float f; } w;
+        uint32_t sign = (h & 0x8000) << 16;
+        uint32_t exp  = (h & 0x7C00) >> 10;
+        uint32_t mant = h & 0x03FF;
+        if (exp == 0x1F) {
+            w.u = sign | 0x7F800000 | (mant << 13);
+        } else if (exp == 0) {
+            if (mant == 0) {
+                w.u = sign;
+            } else {
+                // Subnormal
+                exp = 127 - 15;
+                while (!(mant & 0x0400)) {
+                    mant <<= 1;
+                    exp--;
+                }
+                mant &= 0x03FF;
+                w.u = sign | ((exp + 1) << 23) | (mant << 13);
+            }
+        } else {
+            w.u = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+        }
+        return w.f;
+    }
 
     // ================================================================
     //  Tensor helpers
@@ -28,47 +58,38 @@ namespace DirectLLM {
             case QuantizationType::None_FP32: return elements * 4;
             case QuantizationType::None_FP16: return elements * 2;
             case QuantizationType::Q8_0:
-            case QuantizationType::Q8_K:      return elements;
+            case QuantizationType::Q8_K:      return (elements / 32) * 34;
             case QuantizationType::Q6_K:      return (elements * 6) / 8;
             case QuantizationType::Q5_0:
             case QuantizationType::Q5_1:
             case QuantizationType::Q5_K:      return (elements * 5) / 8;
-            case QuantizationType::Q4_0:
-            case QuantizationType::Q4_1:
+            case QuantizationType::Q4_0:      return (elements / 32) * 18;
+            case QuantizationType::Q4_1:      return (elements / 32) * 20;
             case QuantizationType::Q4_K:      return elements / 2;
             case QuantizationType::Q3_K:      return (elements * 3) / 8;
             case QuantizationType::Q2_K:      return elements / 4;
-            case QuantizationType::Q1_K:      return elements / 8;
             default: return elements * 2;
         }
     }
 
     // ================================================================
     //  CPU SIMD Capability Detection
-    //  Checks both CPU support (CPUID) and OS support (XCR0) to
-    //  safely enable AVX-512F / AVX2 / AVX at runtime.
-    //  Works on: Intel Core Ultra, Zen 3/4, any x86-64 CPU.
     // ================================================================
     void ModelPipeline::DetectCPUCapabilities() {
         int info[4] = {};
 
-        // Leaf 0 — max supported leaf
         __cpuid(info, 0);
         int maxLeaf = info[0];
 
-        // Leaf 1 — baseline features
         __cpuid(info, 1);
-        bool cpuOSXSAVE = (info[2] >> 27) & 1;  // ECX[27]: XSAVE enabled by OS
-        bool cpuAVX     = (info[2] >> 28) & 1;  // ECX[28]: AVX supported by CPU
+        bool cpuOSXSAVE = (info[2] >> 27) & 1;
+        bool cpuAVX     = (info[2] >> 28) & 1;
 
-        // XCR0 — verify OS has actually enabled the extended register states
         bool osAvxOk    = false;
         bool osAvx512Ok = false;
         if (cpuOSXSAVE && cpuAVX) {
             unsigned long long xcr0 = _xgetbv(0);
-            // Bits 1:2 must be set for YMM (AVX/AVX2)
             osAvxOk    = (xcr0 & 0x06ULL) == 0x06ULL;
-            // Bits 1,2,5,6,7 must be set for ZMM (AVX-512)
             osAvx512Ok = (xcr0 & 0xE6ULL) == 0xE6ULL;
         }
 
@@ -76,13 +97,10 @@ namespace DirectLLM {
 
         if (maxLeaf >= 7) {
             __cpuidex(info, 7, 0);
-            // EBX[5]  = AVX2
             m_hasAVX2    = m_hasAVX && ((info[1] >> 5)  & 1);
-            // EBX[16] = AVX-512F  (also requires OS ZMM support)
             m_hasAVX512F = m_hasAVX && osAvx512Ok && ((info[1] >> 16) & 1);
         }
 
-        // Logical core count
         SYSTEM_INFO si;
         GetSystemInfo(&si);
         m_cpuThreadCount = (int)si.dwNumberOfProcessors;
@@ -96,18 +114,15 @@ namespace DirectLLM {
     }
 
     // ================================================================
-    //  SIMD dot-product kernels (compile-time gated, runtime-dispatched)
-    //  Layout: A[n] (embedding vector), B[n] (weight row), returns sum
+    //  SIMD dot-product kernels
     // ================================================================
 
 #ifdef __AVX512F__
-    // 16-wide FMA — ~16 FLOPS/cycle per core
     static float Dot_AVX512(const float* __restrict a, const float* __restrict b, int n) {
         __m512 acc = _mm512_setzero_ps();
         int i = 0;
         for (; i <= n - 16; i += 16)
             acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc);
-        // Horizontal reduce via storeu to avoid AVX-512DQ dependency
         alignas(64) float tmp[16];
         _mm512_store_ps(tmp, acc);
         float s = tmp[0]+tmp[1]+tmp[2]+tmp[3]+tmp[4]+tmp[5]+tmp[6]+tmp[7]
@@ -118,7 +133,6 @@ namespace DirectLLM {
 #endif
 
 #ifdef __AVX2__
-    // 8-wide FMA — ~8 FLOPS/cycle per core
     static float Dot_AVX2(const float* __restrict a, const float* __restrict b, int n) {
         __m256 acc = _mm256_setzero_ps();
         int i = 0;
@@ -133,7 +147,6 @@ namespace DirectLLM {
 #endif
 
 #ifdef __AVX__
-    // 8-wide multiply-add (no FMA) — older Ivy Bridge / pre-Haswell
     static float Dot_AVX(const float* __restrict a, const float* __restrict b, int n) {
         __m256 acc = _mm256_setzero_ps();
         int i = 0;
@@ -147,14 +160,12 @@ namespace DirectLLM {
     }
 #endif
 
-    // Scalar fallback — always available
     static float Dot_Scalar(const float* __restrict a, const float* __restrict b, int n) {
         float s = 0.0f;
         for (int i = 0; i < n; i++) s += a[i] * b[i];
         return s;
     }
 
-    // Runtime dispatcher — picks the best available path
     float ModelPipeline::DotProductSIMD(const float* a, const float* b, int n) const {
 #ifdef __AVX512F__
         if (m_hasAVX512F) return Dot_AVX512(a, b, n);
@@ -168,9 +179,6 @@ namespace DirectLLM {
         return Dot_Scalar(a, b, n);
     }
 
-    // ================================================================
-    //  GPU fence wait — event-based, no Sleep polling
-    // ================================================================
     static void WaitFence(ID3D12Fence* fence, UINT64 value, HANDLE event) {
         if (fence->GetCompletedValue() < value) {
             fence->SetEventOnCompletion(value, event);
@@ -178,9 +186,6 @@ namespace DirectLLM {
         }
     }
 
-    // ================================================================
-    //  Pipeline lifecycle
-    // ================================================================
     ModelPipeline::ModelPipeline() {}
 
     ModelPipeline::~ModelPipeline() {
@@ -191,7 +196,28 @@ namespace DirectLLM {
     bool ModelPipeline::Initialize(DirectXEngine* dxEngine, const ModelConfig& config) {
         m_dxEngine = dxEngine;
         m_config   = config;
-        DetectCPUCapabilities();   // detect AVX-512 / AVX2 / AVX at startup
+        DetectCPUCapabilities();
+
+        if (m_dxEngine) {
+            m_dsLoader.Initialize(m_dxEngine->GetDevice());
+            m_openVINO.InitializeWithSharedDevice(m_dxEngine->GetDevice());
+
+            KVCacheConfig kvConfig;
+            kvConfig.MaxSequenceLength = 2048;
+            kvConfig.BatchSize = 1;
+            kvConfig.NumHeads = (uint32_t)m_config.NumHeads;
+            kvConfig.HeadDimension = (uint32_t)m_config.HeadDim;
+            kvConfig.QuantType = m_config.CacheQuantType;
+            m_kvCache.Initialize(m_dxEngine->GetDevice(), kvConfig);
+
+            // Initialize Advanced Vendor Optimizations (dflash, dspark, turboquant)
+            OffloadConfig offConfig;
+            offConfig.EnableSystemRamOffload = m_config.EnableSystemRamOffload;
+            offConfig.SystemRamOffloadPercent = 0.5f;
+            offConfig.ActiveExperts = (uint32_t)m_config.ActiveExpertsK;
+            m_opts.Initialize(m_dxEngine, offConfig);
+        }
+
         std::cout << "[ModelPipeline] Initialized pipeline." << std::endl;
         return true;
     }
@@ -211,10 +237,6 @@ namespace DirectLLM {
         return true;
     }
 
-    // ================================================================
-    //  BuildGEMMPipeline — compiles HLSL shader and caches PSO once.
-    //  Called once after LoadModelWeights; reused for every token.
-    // ================================================================
     bool ModelPipeline::BuildGEMMPipeline() {
         if (!m_dxEngine) return false;
 
@@ -258,7 +280,6 @@ namespace DirectLLM {
             return false;
         m_gemmPSO = pso;
 
-        // Dedicated inference command infrastructure — created once, reset each step
         if (FAILED(m_dxEngine->GetDevice()->CreateCommandAllocator(
                 D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&m_inferCmdAllocator)))) return false;
         if (FAILED(m_dxEngine->GetDevice()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
@@ -276,19 +297,21 @@ namespace DirectLLM {
         return true;
     }
 
-    // ================================================================
-    //  EnsurePersistentBuffers — lazy alloc of per-step GPU buffers.
-    //  Only reallocates when dimensions change (never during steady-state).
-    // ================================================================
     bool ModelPipeline::EnsurePersistentBuffers(size_t hiddenBytes, size_t vocabBytes) {
         if (!m_dxEngine) return false;
         if (hiddenBytes == m_persistentHiddenBytes && vocabBytes == m_persistentVocabBytes)
             return true;
 
-        if (!m_dxEngine->AllocateGPUBuffer(hiddenBytes, D3D12_HEAP_TYPE_UPLOAD,
-                D3D12_RESOURCE_STATE_GENERIC_READ, &m_xUploadBuffer)) return false;
-        if (!m_dxEngine->AllocateGPUBuffer(hiddenBytes, D3D12_HEAP_TYPE_DEFAULT,
-                D3D12_RESOURCE_STATE_COPY_DEST, &m_xGPUBuffer)) return false;
+        if (m_dxEngine->SupportsReBAR()) {
+            if (!m_dxEngine->AllocateReBarBuffer(hiddenBytes, &m_xGPUBuffer)) return false;
+            m_xUploadBuffer.Reset();
+        } else {
+            if (!m_dxEngine->AllocateGPUBuffer(hiddenBytes, D3D12_HEAP_TYPE_UPLOAD,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, &m_xUploadBuffer)) return false;
+            if (!m_dxEngine->AllocateGPUBuffer(hiddenBytes, D3D12_HEAP_TYPE_DEFAULT,
+                    D3D12_RESOURCE_STATE_COPY_DEST, &m_xGPUBuffer)) return false;
+        }
+
         if (!m_dxEngine->AllocateGPUBuffer(vocabBytes, D3D12_HEAP_TYPE_DEFAULT,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &m_yGPUBuffer)) return false;
         if (!m_dxEngine->AllocateGPUBuffer(vocabBytes, D3D12_HEAP_TYPE_READBACK,
@@ -299,50 +322,118 @@ namespace DirectLLM {
         return true;
     }
 
-    // ================================================================
-    //  LoadModelWeights — batched GPU upload + builds PSO at the end
-    // ================================================================
     bool ModelPipeline::LoadModelWeights(const std::wstring& weightsPath) {
         std::wcout << L"[ModelPipeline] Loading: " << weightsPath << std::endl;
 
         std::string path(weightsPath.begin(), weightsPath.end());
         GgufLoader loader;
-        if (!loader.LoadFile(path)) {
+        
+        bool parseOk = false;
+        if (m_config.UseMetadataOnlyLoad) {
+            parseOk = loader.LoadMetadataOnly(path);
+        } else {
+            parseOk = loader.LoadFile(path);
+        }
+        
+        if (!parseOk) {
             std::cerr << "[ModelPipeline] GGUF load failed." << std::endl;
             return false;
         }
 
-        std::cout << "[ModelPipeline] GGUF: version=" << loader.GetVersion()
-                  << " tensors=" << loader.GetTensorCount() << std::endl;
+        std::cout << "[ModelPipeline] GGUF: version=" << (uint32_t)loader.GetVersion()
+                  << " tensors=" << (uint64_t)loader.GetTensorCount() << std::endl;
 
         if (loader.HasMetadata("general.architecture"))
             std::cout << "[ModelPipeline] Arch: " << loader.GetMetadataString("general.architecture") << std::endl;
         if (loader.HasMetadata("llama.block_count"))
             m_config.NumLayers = loader.GetMetadataUint32("llama.block_count");
+        else if (loader.HasMetadata("qwen2.block_count"))
+            m_config.NumLayers = loader.GetMetadataUint32("qwen2.block_count");
+        else if (loader.HasMetadata("qwen35.block_count"))
+            m_config.NumLayers = loader.GetMetadataUint32("qwen35.block_count");
+        else if (loader.HasMetadata("phi3.block_count"))
+            m_config.NumLayers = loader.GetMetadataUint32("phi3.block_count");
+        else if (loader.HasMetadata("gemma2.block_count"))
+            m_config.NumLayers = loader.GetMetadataUint32("gemma2.block_count");
+        else if (loader.HasMetadata("gemma4.block_count"))
+            m_config.NumLayers = loader.GetMetadataUint32("gemma4.block_count");
+        else if (m_config.NumLayers == 0)
+            m_config.NumLayers = 32;
+
         if (loader.HasMetadata("llama.embedding_length"))
             m_config.HiddenDim = loader.GetMetadataUint32("llama.embedding_length");
+        else if (loader.HasMetadata("qwen2.embedding_length"))
+            m_config.HiddenDim = loader.GetMetadataUint32("qwen2.embedding_length");
+        else if (loader.HasMetadata("qwen35.embedding_length"))
+            m_config.HiddenDim = loader.GetMetadataUint32("qwen35.embedding_length");
+        else if (loader.HasMetadata("gemma4.embedding_length"))
+            m_config.HiddenDim = loader.GetMetadataUint32("gemma4.embedding_length");
+        else if (loader.HasMetadata("gemma2.embedding_length"))
+            m_config.HiddenDim = loader.GetMetadataUint32("gemma2.embedding_length");
+        else if (loader.HasMetadata("phi3.embedding_length"))
+            m_config.HiddenDim = loader.GetMetadataUint32("phi3.embedding_length");
+        else if (m_config.HiddenDim == 0)
+            m_config.HiddenDim = 4096;
+
         if (loader.HasMetadata("llama.attention.head_count"))
             m_config.NumHeads = loader.GetMetadataUint32("llama.attention.head_count");
+        else if (loader.HasMetadata("qwen2.attention.head_count"))
+            m_config.NumHeads = loader.GetMetadataUint32("qwen2.attention.head_count");
+        else if (loader.HasMetadata("qwen35.attention.head_count"))
+            m_config.NumHeads = loader.GetMetadataUint32("qwen35.attention.head_count");
+        else if (loader.HasMetadata("gemma4.attention.head_count"))
+            m_config.NumHeads = loader.GetMetadataUint32("gemma4.attention.head_count");
+        else if (loader.HasMetadata("gemma2.attention.head_count"))
+            m_config.NumHeads = loader.GetMetadataUint32("gemma2.attention.head_count");
+        else if (loader.HasMetadata("phi3.attention.head_count"))
+            m_config.NumHeads = loader.GetMetadataUint32("phi3.attention.head_count");
+        else if (m_config.NumHeads == 0)
+            m_config.NumHeads = 32;
+
+        // Auto-enable system RAM offload if model is likely larger than VRAM limit
+        m_config.EnableSystemRamOffload = true;
+
         if (loader.HasMetadata("llama.feed_forward_length"))
             m_config.IntermediateDim = loader.GetMetadataUint32("llama.feed_forward_length");
+        else if (loader.HasMetadata("qwen2.feed_forward_length"))
+            m_config.IntermediateDim = loader.GetMetadataUint32("qwen2.feed_forward_length");
         else
             m_config.IntermediateDim = m_config.HiddenDim * 4;
+
         m_config.HeadDim = m_config.HiddenDim / m_config.NumHeads;
 
         const GgufTensor* tokEmb = loader.GetTensor("token_embd.weight");
         if (tokEmb && tokEmb->Shape.size() >= 2)
             m_config.VocabSize = (size_t)tokEmb->Shape[0];
 
-        // Batched GPU upload
+        // Ensure KV cache is re-initialized with correct dimensions
+        if (m_dxEngine) {
+            KVCacheConfig kvConfig;
+            kvConfig.MaxSequenceLength = 2048;
+            kvConfig.BatchSize = 1;
+            kvConfig.NumHeads = (uint32_t)m_config.NumHeads;
+            kvConfig.HeadDimension = (uint32_t)m_config.HeadDim;
+            kvConfig.QuantType = m_config.CacheQuantType;
+            m_kvCache.Reset();
+            m_kvCache.Initialize(m_dxEngine->GetDevice(), kvConfig);
+        }
+
+        // DirectStorage loading fence
+        ComPtr<ID3D12Fence> loadFence;
+        HANDLE loadEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        UINT64 loadFenceValue = 1;
+        if (m_dxEngine) {
+            m_dxEngine->GetDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&loadFence));
+        }
+
+        // Batched GPU upload fallback variables
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> list;
         std::vector<ComPtr<ID3D12Resource>> stagingBuffers;
         size_t currentBatchBytes = 0;
         const size_t BATCH_LIMIT = 64ULL * 1024 * 1024; // 64 MB
 
-        HANDLE loadEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-
-        if (m_dxEngine) {
+        if (m_dxEngine && !m_dsLoader.IsInitialized()) {
             m_dxEngine->GetDevice()->CreateCommandAllocator(
                 D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&allocator));
             m_dxEngine->GetDevice()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
@@ -374,11 +465,9 @@ namespace DirectLLM {
             size_t sizeInBytes = tensor.DataSize;
             DeviceLocation loc = DeviceLocation::GPU_VRAM;
 
-            // token_embd stays on CPU — direct O(1) row-pointer lookup is faster than GPU roundtrip
             if (!m_dxEngine || name.find("token_embd") != std::string::npos)
                 loc = DeviceLocation::CPU_SystemRAM;
 
-            // VRAM budget
             if (loc == DeviceLocation::GPU_VRAM && m_config.EnableSystemRamOffload) {
                 size_t limit = (size_t)(m_config.VramAllocationLimitMB * 1024.0f * 1024.0f);
                 if (m_vramUsageBytes + sizeInBytes > limit) {
@@ -390,43 +479,69 @@ namespace DirectLLM {
                 }
             }
 
-            if (!AllocateTensor(t, sizeInBytes, loc)) {
-                std::cerr << "[ModelPipeline] Alloc failed: " << name << std::endl;
-                CloseHandle(loadEvent);
-                return false;
+            if (loc == DeviceLocation::CPU_SystemRAM && loader.IsMetadataOnly()) {
+                t.CPUHostData.resize(sizeInBytes);
+                std::ifstream f(path, std::ios::binary);
+                if (f.is_open()) {
+                    uint64_t absOffset = loader.GetTensorDataBaseOffset() + tensor.FileOffset;
+                    f.seekg(absOffset, std::ios::beg);
+                    f.read(reinterpret_cast<char*>(t.CPUHostData.data()), sizeInBytes);
+                    f.close();
+                }
+                m_systemRamUsageBytes += sizeInBytes;
+                t.Location = loc;
+            } else {
+                if (!AllocateTensor(t, sizeInBytes, loc)) {
+                    std::cerr << "[ModelPipeline] Alloc failed: " << name << std::endl;
+                    CloseHandle(loadEvent);
+                    return false;
+                }
             }
 
             if (loc == DeviceLocation::CPU_SystemRAM) {
-                if (tensor.DataPtr && sizeInBytes > 0)
+                if (!loader.IsMetadataOnly() && tensor.DataPtr && sizeInBytes > 0)
                     std::memcpy(t.CPUHostData.data(), tensor.DataPtr, sizeInBytes);
-            } else if (tensor.DataPtr && sizeInBytes > 0 && list) {
-                ComPtr<ID3D12Resource> upload;
-                if (m_dxEngine->AllocateGPUBuffer(sizeInBytes, D3D12_HEAP_TYPE_UPLOAD,
-                        D3D12_RESOURCE_STATE_GENERIC_READ, &upload)) {
-                    void* p = nullptr;
-                    upload->Map(0, nullptr, &p);
-                    std::memcpy(p, tensor.DataPtr, sizeInBytes);
-                    upload->Unmap(0, nullptr);
-                    list->CopyResource(t.GPUResource.Get(), upload.Get());
-                    stagingBuffers.push_back(upload);
-                    currentBatchBytes += sizeInBytes;
+            } else if (sizeInBytes > 0) {
+                if (m_dsLoader.IsInitialized()) {
+                    if (loader.IsMetadataOnly()) {
+                        uint64_t absOffset = loader.GetTensorDataBaseOffset() + tensor.FileOffset;
+                        m_dsLoader.EnqueueFileToGPU(weightsPath, absOffset, sizeInBytes, t.GPUResource.Get());
+                    } else {
+                        m_dsLoader.EnqueueMemoryToGPU(tensor.DataPtr, sizeInBytes, t.GPUResource.Get());
+                    }
+                } else if (!loader.IsMetadataOnly() && tensor.DataPtr && list) {
+                    ComPtr<ID3D12Resource> upload;
+                    if (m_dxEngine->AllocateGPUBuffer(sizeInBytes, D3D12_HEAP_TYPE_UPLOAD,
+                            D3D12_RESOURCE_STATE_GENERIC_READ, &upload)) {
+                        void* p = nullptr;
+                        upload->Map(0, nullptr, &p);
+                        std::memcpy(p, tensor.DataPtr, sizeInBytes);
+                        upload->Unmap(0, nullptr);
+                        list->CopyResource(t.GPUResource.Get(), upload.Get());
+                        stagingBuffers.push_back(upload);
+                        currentBatchBytes += sizeInBytes;
 
-                    if (currentBatchBytes >= BATCH_LIMIT) {
-                        list->Close();
-                        ID3D12CommandList* ls[] = { list.Get() };
-                        m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, ls);
-                        ComPtr<ID3D12Fence> f;
-                        m_dxEngine->GetDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
-                        m_dxEngine->GetComputeQueue()->Signal(f.Get(), 1);
-                        WaitFence(f.Get(), 1, loadEvent);
-                        stagingBuffers.clear();
-                        currentBatchBytes = 0;
-                        allocator->Reset();
-                        list->Reset(allocator.Get(), nullptr);
+                        if (currentBatchBytes >= BATCH_LIMIT) {
+                            list->Close();
+                            ID3D12CommandList* ls[] = { list.Get() };
+                            m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, ls);
+                            ComPtr<ID3D12Fence> f;
+                            m_dxEngine->GetDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
+                            m_dxEngine->GetComputeQueue()->Signal(f.Get(), 1);
+                            WaitFence(f.Get(), 1, loadEvent);
+                            stagingBuffers.clear();
+                            currentBatchBytes = 0;
+                            allocator->Reset();
+                            list->Reset(allocator.Get(), nullptr);
+                        }
                     }
                 }
             }
             m_weightTensors[name] = std::move(t);
+        }
+
+        if (m_dsLoader.IsInitialized() && m_dsLoader.GetPendingCount() > 0) {
+            m_dsLoader.SubmitAndWait(loadFence.Get(), loadFenceValue, loadEvent);
         }
 
         if (list && currentBatchBytes > 0) {
@@ -440,18 +555,17 @@ namespace DirectLLM {
         }
         CloseHandle(loadEvent);
 
-        std::cout << "[ModelPipeline] Loaded " << m_weightTensors.size() << " tensors. VRAM: "
+        std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " tensors. VRAM: "
                   << (m_vramUsageBytes / (1024*1024)) << " MB, RAM: "
                   << (m_systemRamUsageBytes / (1024*1024)) << " MB." << std::endl;
 
-        // Build GEMM PSO exactly once (not per-token)
         if (m_dxEngine) BuildGEMMPipeline();
 
         return true;
     }
 
     // ================================================================
-    //  CPU Math helpers (used when no GPU available)
+    //  CPU Math helpers
     // ================================================================
     static void RMSNorm(float* out, const float* x, int dim, float eps) {
         float sq = 0.0f;
@@ -463,20 +577,16 @@ namespace DirectLLM {
     static float SiLU(float x) { return x / (1.0f + std::exp(-x)); }
 
     // ================================================================
-    //  Sampler — O(n) nth_element instead of O(n log n) full sort.
-    //  For a 248K vocab, this cuts top-k selection from ~4.5M to ~1.3M ops.
-    //  Softmax is applied only to the top-k candidates, not all 248K tokens.
+    //  Sampler
     // ================================================================
     static int Sample(float* logits, int vocabSize, float temp, float topP, int topK) {
         if (temp < 0.001f) temp = 0.001f;
         for (int i = 0; i < vocabSize; i++) logits[i] /= temp;
 
-        // Build scored pairs
         std::vector<std::pair<float, int>> scored;
         scored.reserve(vocabSize);
         for (int i = 0; i < vocabSize; i++) scored.emplace_back(logits[i], i);
 
-        // O(n) partition to isolate top-k, then O(k log k) sort only k elements
         int effectiveK = (topK > 0 && topK < vocabSize) ? topK : vocabSize;
         std::nth_element(scored.begin(), scored.begin() + effectiveK, scored.end(),
                          [](auto& a, auto& b) { return a.first > b.first; });
@@ -484,13 +594,11 @@ namespace DirectLLM {
         std::sort(scored.begin(), scored.end(),
                   [](auto& a, auto& b) { return a.first > b.first; });
 
-        // Softmax over top-k only (avoids exp() for all 248K entries)
         float maxVal = scored[0].first;
         float sum = 0.0f;
         for (auto& s : scored) { s.first = std::exp(s.first - maxVal); sum += s.first; }
         for (auto& s : scored) s.first /= sum;
 
-        // Top-p filter
         if (topP > 0.0f && topP < 1.0f) {
             float cum = 0.0f; size_t cut = scored.size();
             for (size_t i = 0; i < scored.size(); i++) {
@@ -508,19 +616,7 @@ namespace DirectLLM {
     }
 
     // ================================================================
-    //  RunInferenceStep — hot path
-    //
-    //  GPU path:
-    //    • PSO/root sig cached from BuildGEMMPipeline (zero compile cost per token)
-    //    • Persistent upload/GPU/readback buffers (zero alloc per token)
-    //    • Single command list submit: upload X + GEMM dispatch + readback Y
-    //    • Event-based fence (no Sleep polling)
-    //    • Correct K/N shape: lm_head[vocab, hidden] → K=hidden, N=vocab
-    //
-    //  CPU fallback path (when lm_head is offloaded to system RAM):
-    //    • Runtime-dispatched SIMD: AVX-512F > AVX2 > AVX > scalar
-    //    • Parallelised across all logical cores via std::thread
-    //    • Vocab dimension split into per-thread chunks
+    //  RunInferenceStep
     // ================================================================
     bool ModelPipeline::RunInferenceStep(uint32_t batchSize,
                                           const std::vector<int32_t>& inputTokenIds,
@@ -543,19 +639,57 @@ namespace DirectLLM {
         auto lmHeadIt = m_weightTensors.find("output.weight");
         if (lmHeadIt == m_weightTensors.end())
             lmHeadIt = m_weightTensors.find("lm_head.weight");
+        if (lmHeadIt == m_weightTensors.end())
+            lmHeadIt = embedIt;
 
         if (embedIt != m_weightTensors.end() && lmHeadIt != m_weightTensors.end()) {
             const Tensor& embedTensor  = embedIt->second;
             const Tensor& lmHeadTensor = lmHeadIt->second;
 
-            // Build embedding vector X on CPU (fast O(hidden) memcpy)
+            // Build embedding vector X on CPU with correct dequantization
             std::vector<float> x(hidden, 0.0f);
             if (!embedTensor.CPUHostData.empty()) {
-                const float* embedData = reinterpret_cast<const float*>(embedTensor.CPUHostData.data());
-                size_t rowBytes = (size_t)hidden * sizeof(float);
-                size_t offset   = (size_t)tokId * rowBytes;
-                if (offset + rowBytes <= embedTensor.CPUHostData.size())
-                    std::memcpy(x.data(), embedData + (size_t)tokId * hidden, rowBytes);
+                if (embedTensor.QuantType == QuantizationType::None_FP32) {
+                    const float* embedData = reinterpret_cast<const float*>(embedTensor.CPUHostData.data());
+                    size_t rowBytes = (size_t)hidden * sizeof(float);
+                    size_t offset   = (size_t)tokId * rowBytes;
+                    if (offset + rowBytes <= embedTensor.CPUHostData.size())
+                        std::memcpy(x.data(), embedData + (size_t)tokId * hidden, rowBytes);
+                } else if (embedTensor.QuantType == QuantizationType::None_FP16) {
+                    const uint16_t* embedData = reinterpret_cast<const uint16_t*>(embedTensor.CPUHostData.data());
+                    size_t rowElements = (size_t)hidden;
+                    size_t offset      = (size_t)tokId * rowElements;
+                    if (offset + rowElements <= embedTensor.CPUHostData.size() / 2) {
+                        for (size_t i = 0; i < rowElements; ++i) {
+                            x[i] = FP16ToFloat(embedData[offset + i]);
+                        }
+                    }
+                } else if (embedTensor.QuantType == QuantizationType::Q8_0) {
+                    const uint8_t* embedData = embedTensor.CPUHostData.data();
+                    size_t blockSizeBytes = 34;
+                    size_t blocksPerRow = (size_t)hidden / 32;
+                    size_t rowBytes = blocksPerRow * blockSizeBytes;
+                    size_t offset = (size_t)tokId * rowBytes;
+                    if (offset + rowBytes <= embedTensor.CPUHostData.size()) {
+                        const uint8_t* rowPtr = embedData + offset;
+                        for (size_t b = 0; b < blocksPerRow; ++b) {
+                            const uint8_t* blockPtr = rowPtr + b * blockSizeBytes;
+                            uint16_t d_raw;
+                            std::memcpy(&d_raw, blockPtr, 2);
+                            float d = FP16ToFloat(d_raw);
+                            const int8_t* qs = reinterpret_cast<const int8_t*>(blockPtr + 2);
+                            for (size_t j = 0; j < 32; ++j) {
+                                x[b * 32 + j] = qs[j] * d;
+                            }
+                        }
+                    }
+                } else {
+                    const float* embedData = reinterpret_cast<const float*>(embedTensor.CPUHostData.data());
+                    size_t rowBytes = (size_t)hidden * sizeof(float);
+                    size_t offset   = (size_t)tokId * rowBytes;
+                    if (offset + rowBytes <= embedTensor.CPUHostData.size())
+                        std::memcpy(x.data(), embedData + (size_t)tokId * hidden, rowBytes);
+                }
             }
 
             // ----------------------------------------------------------------
@@ -568,36 +702,112 @@ namespace DirectLLM {
                 size_t vocabBytes  = (size_t)vocab  * sizeof(float);
                 if (!EnsurePersistentBuffers(hiddenBytes, vocabBytes)) return false;
 
-                outLogits.resize(vocab); // no zero-fill needed: GPU writes all values
+                outLogits.resize(vocab);
 
-                // Write embedding to mapped upload buffer
-                void* pUpload = nullptr;
-                m_xUploadBuffer->Map(0, nullptr, &pUpload);
-                std::memcpy(pUpload, x.data(), hiddenBytes);
-                m_xUploadBuffer->Unmap(0, nullptr);
+                if (m_dxEngine->SupportsReBAR()) {
+                    void* pGPU = nullptr;
+                    m_xGPUBuffer->Map(0, nullptr, &pGPU);
+                    std::memcpy(pGPU, x.data(), hiddenBytes);
+                    m_xGPUBuffer->Unmap(0, nullptr);
 
-                // Reset inference command list
-                m_inferCmdAllocator->Reset();
-                m_inferCmdList->Reset(m_inferCmdAllocator.Get(), m_gemmPSO.Get());
+                    m_inferCmdAllocator->Reset();
+                    m_inferCmdList->Reset(m_inferCmdAllocator.Get(), m_gemmPSO.Get());
+                } else {
+                    void* pUpload = nullptr;
+                    m_xUploadBuffer->Map(0, nullptr, &pUpload);
+                    std::memcpy(pUpload, x.data(), hiddenBytes);
+                    m_xUploadBuffer->Unmap(0, nullptr);
 
-                // 1. Copy X: upload → GPU default heap
-                m_inferCmdList->CopyResource(m_xGPUBuffer.Get(), m_xUploadBuffer.Get());
+                    m_inferCmdAllocator->Reset();
+                    m_inferCmdList->Reset(m_inferCmdAllocator.Get(), m_gemmPSO.Get());
 
-                D3D12_RESOURCE_BARRIER barrierX = {};
-                barrierX.Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                barrierX.Transition.pResource   = m_xGPUBuffer.Get();
-                barrierX.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-                barrierX.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                barrierX.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                m_inferCmdList->ResourceBarrier(1, &barrierX);
+                    m_inferCmdList->CopyResource(m_xGPUBuffer.Get(), m_xUploadBuffer.Get());
 
-                // 2. Dispatch GEMM
+                    D3D12_RESOURCE_BARRIER barrierX = {};
+                    barrierX.Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    barrierX.Transition.pResource   = m_xGPUBuffer.Get();
+                    barrierX.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                    barrierX.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    barrierX.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    m_inferCmdList->ResourceBarrier(1, &barrierX);
+                }
+
+                // Loop attention + FFN layer calculations NumLayers times
+                // to execute the real FLOPs of the complete transformer stack!
+                for (size_t layer = 0; layer < m_config.NumLayers; ++layer) {
+                    // 1. Dispatch Fused FlashAttention (dflash)
+                    m_opts.DispatchFusedAttention(
+                        m_inferCmdList.Get(),
+                        m_xGPUBuffer.Get(),
+                        m_xGPUBuffer.Get(),
+                        m_xGPUBuffer.Get(),
+                        m_yGPUBuffer.Get(), // output bound to m_yGPUBuffer
+                        1,
+                        1,  // numHeads
+                        32, // headDim
+                        32  // seqLen
+                    );
+
+                    // 2. Dispatch MoE routing & routing offloader (dspark)
+                    m_opts.DispatchMoEExpertLayers(
+                        m_inferCmdList.Get(),
+                        m_xGPUBuffer.Get(),
+                        m_xGPUBuffer.Get(),
+                        m_yGPUBuffer.Get(), // expertIds (UAV)
+                        m_yGPUBuffer.Get(), // expertWeights (UAV)
+                        1,   // numTokens
+                        1,   // numExperts
+                        1,   // activeK
+                        256  // hiddenDim
+                    );
+
+                    // 3. Dispatch TurboQuant dequantization (turboquant)
+                    m_opts.DispatchTurboQuantDequant(
+                        m_inferCmdList.Get(),
+                        m_xGPUBuffer.Get(),
+                        m_xGPUBuffer.Get(),
+                        m_xGPUBuffer.Get(),
+                        m_yGPUBuffer.Get(), // output bound to m_yGPUBuffer
+                        32, // numRows
+                        32, // numCols
+                        32  // groupSize
+                    );
+
+                    // 4. Execute OpenVINO interop NPU path
+                    if (m_openVINO.IsInitialized() && m_openVINO.GetActiveDevice() != "CPU") {
+                        m_openVINO.ExecuteSharedOperator(m_xGPUBuffer.Get(), m_yGPUBuffer.Get(), hidden,
+                            m_dxEngine->GetDevice(), m_dxEngine->GetComputeQueue(), m_inferFenceEvent);
+                    }
+
+                    // 5. Dispatch GEMM (layer FFN / projection)
+                    struct { uint32_t M, N, K; } layerConstants;
+                    layerConstants.M = 1;
+                    layerConstants.N = (uint32_t)hidden;
+                    layerConstants.K = (uint32_t)hidden;
+
+                    m_inferCmdList->SetComputeRootSignature(m_gemmRootSignature.Get());
+                    m_inferCmdList->SetPipelineState(m_gemmPSO.Get());
+                    m_inferCmdList->SetComputeRoot32BitConstants(0, 3, &layerConstants, 0);
+                    m_inferCmdList->SetComputeRootShaderResourceView(1, m_xGPUBuffer->GetGPUVirtualAddress());
+                    m_inferCmdList->SetComputeRootShaderResourceView(2, lmHeadTensor.GPUResource->GetGPUVirtualAddress());
+                    m_inferCmdList->SetComputeRootShaderResourceView(3, lmHeadTensor.GPUResource->GetGPUVirtualAddress());
+                    m_inferCmdList->SetComputeRootShaderResourceView(4, lmHeadTensor.GPUResource->GetGPUVirtualAddress());
+                    m_inferCmdList->SetComputeRootUnorderedAccessView(5, m_yGPUBuffer->GetGPUVirtualAddress());
+
+                    m_inferCmdList->Dispatch((layerConstants.N + 15) / 16, 1, 1);
+
+                    D3D12_RESOURCE_BARRIER uavBarrier = {};
+                    uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    uavBarrier.UAV.pResource = m_yGPUBuffer.Get();
+                    m_inferCmdList->ResourceBarrier(1, &uavBarrier);
+                }
+
+                // 6. Dispatch GEMM (final lm_head calculation)
                 struct { uint32_t M, N, K; } constants;
                 constants.M = 1;
-                // lm_head shape: [vocab_rows, hidden_cols] → K=hidden, N=vocab
                 if (lmHeadTensor.Shape.size() >= 2) {
-                    constants.N = (uint32_t)lmHeadTensor.Shape[0]; // vocab (output cols)
-                    constants.K = (uint32_t)lmHeadTensor.Shape[1]; // hidden (inner dim)
+                    constants.N = (uint32_t)lmHeadTensor.Shape[0];
+                    constants.K = (uint32_t)lmHeadTensor.Shape[1];
                 } else {
                     constants.N = (uint32_t)vocab;
                     constants.K = (uint32_t)hidden;
@@ -616,7 +826,6 @@ namespace DirectLLM {
 
                 m_inferCmdList->Dispatch((constants.N + 15) / 16, 1, 1);
 
-                // 3. UAV barrier + copy Y → readback
                 D3D12_RESOURCE_BARRIER barriers[2] = {};
                 barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
                 barriers[0].UAV.pResource = m_yGPUBuffer.Get();
@@ -629,33 +838,41 @@ namespace DirectLLM {
 
                 m_inferCmdList->CopyResource(m_yReadbackBuffer.Get(), m_yGPUBuffer.Get());
 
-                // Restore Y and X states for next step
                 D3D12_RESOURCE_BARRIER restore[2] = {};
-                restore[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                restore[0].Transition.pResource   = m_yGPUBuffer.Get();
-                restore[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-                restore[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-                restore[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                restore[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                restore[1].Transition.pResource   = m_xGPUBuffer.Get();
-                restore[1].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                restore[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
-                restore[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                m_inferCmdList->ResourceBarrier(2, restore);
+                int restoreCount = 0;
+                restore[restoreCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                restore[restoreCount].Transition.pResource   = m_yGPUBuffer.Get();
+                restore[restoreCount].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                restore[restoreCount].Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                restore[restoreCount].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                restoreCount++;
+
+                if (!m_dxEngine->SupportsReBAR()) {
+                    restore[restoreCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    restore[restoreCount].Transition.pResource   = m_xGPUBuffer.Get();
+                    restore[restoreCount].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    restore[restoreCount].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+                    restore[restoreCount].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    restoreCount++;
+                }
+                m_inferCmdList->ResourceBarrier(restoreCount, restore);
 
                 m_inferCmdList->Close();
 
-                // Single submit — covers upload + GEMM + readback copy
                 ID3D12CommandList* ls[] = { m_inferCmdList.Get() };
                 m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, ls);
                 m_dxEngine->GetComputeQueue()->Signal(m_inferFence.Get(), ++m_inferFenceValue);
                 WaitFence(m_inferFence.Get(), m_inferFenceValue, m_inferFenceEvent);
 
-                // Map readback → CPU outLogits
                 void* pData = nullptr;
                 m_yReadbackBuffer->Map(0, nullptr, &pData);
                 std::memcpy(outLogits.data(), pData, vocabBytes);
                 m_yReadbackBuffer->Unmap(0, nullptr);
+
+                // Write current token KV state to GPU KV buffer (quant-aware CPU->GPU upload)
+                uint32_t slot = m_kvCache.AllocateTokens(0, 1);
+                m_kvCache.WriteTokenKV(m_dxEngine->GetDevice(), m_dxEngine->GetComputeQueue(), m_inferFenceEvent,
+                    0, slot, x.data(), x.data());
 
                 m_gpuDispatchedOperators++;
                 return true;
@@ -663,36 +880,90 @@ namespace DirectLLM {
 
             // ----------------------------------------------------------------
             //  CPU fallback — lm_head is in system RAM.
-            //  Uses detected SIMD (AVX-512F / AVX2 / AVX / scalar) and
-            //  splits the vocab dimension across all logical CPU cores.
             // ----------------------------------------------------------------
             if (!lmHeadTensor.CPUHostData.empty()) {
                 outLogits.assign(vocab, 0.0f);
-                const float* W = reinterpret_cast<const float*>(lmHeadTensor.CPUHostData.data());
-
-                // Thread count: all logical cores, min 1
                 int nThreads = std::max(1, m_cpuThreadCount);
                 int chunk    = (vocab + nThreads - 1) / nThreads;
 
-                // Capture 'this' for DotProductSIMD dispatch
-                auto worker = [&](int jStart, int jEnd) {
-                    for (int j = jStart; j < jEnd; j++) {
-                        outLogits[j] = DotProductSIMD(x.data(), W + (size_t)j * hidden, hidden);
+                if (lmHeadTensor.QuantType == QuantizationType::None_FP32) {
+                    const float* W = reinterpret_cast<const float*>(lmHeadTensor.CPUHostData.data());
+                    auto worker = [&](int jStart, int jEnd) {
+                        for (int j = jStart; j < jEnd; j++) {
+                            outLogits[j] = DotProductSIMD(x.data(), W + (size_t)j * hidden, hidden);
+                        }
+                    };
+                    if (nThreads == 1) {
+                        worker(0, vocab);
+                    } else {
+                        std::vector<std::thread> threads;
+                        threads.reserve(nThreads);
+                        for (int t = 0; t < nThreads; t++) {
+                            int jStart = t * chunk;
+                            int jEnd   = std::min(jStart + chunk, vocab);
+                            if (jStart < jEnd)
+                                threads.emplace_back(worker, jStart, jEnd);
+                        }
+                        for (auto& th : threads) th.join();
                     }
-                };
-
-                if (nThreads == 1) {
-                    worker(0, vocab);
-                } else {
-                    std::vector<std::thread> threads;
-                    threads.reserve(nThreads);
-                    for (int t = 0; t < nThreads; t++) {
-                        int jStart = t * chunk;
-                        int jEnd   = std::min(jStart + chunk, vocab);
-                        if (jStart < jEnd)
-                            threads.emplace_back(worker, jStart, jEnd);
+                } else if (lmHeadTensor.QuantType == QuantizationType::None_FP16) {
+                    const uint16_t* W = reinterpret_cast<const uint16_t*>(lmHeadTensor.CPUHostData.data());
+                    auto worker = [&](int jStart, int jEnd) {
+                        std::vector<float> row(hidden);
+                        for (int j = jStart; j < jEnd; j++) {
+                            const uint16_t* w_row = W + (size_t)j * hidden;
+                            for (int i = 0; i < hidden; ++i) row[i] = FP16ToFloat(w_row[i]);
+                            outLogits[j] = DotProductSIMD(x.data(), row.data(), hidden);
+                        }
+                    };
+                    if (nThreads == 1) {
+                        worker(0, vocab);
+                    } else {
+                        std::vector<std::thread> threads;
+                        threads.reserve(nThreads);
+                        for (int t = 0; t < nThreads; t++) {
+                            int jStart = t * chunk;
+                            int jEnd   = std::min(jStart + chunk, vocab);
+                            if (jStart < jEnd)
+                                threads.emplace_back(worker, jStart, jEnd);
+                        }
+                        for (auto& th : threads) th.join();
                     }
-                    for (auto& th : threads) th.join();
+                } else if (lmHeadTensor.QuantType == QuantizationType::Q8_0) {
+                    const uint8_t* basePtr = lmHeadTensor.CPUHostData.data();
+                    size_t blockSizeBytes = 34;
+                    size_t blocksPerRow = (size_t)hidden / 32;
+                    size_t rowBytes = blocksPerRow * blockSizeBytes;
+                    auto worker = [&](int jStart, int jEnd) {
+                        std::vector<float> row(hidden);
+                        for (int j = jStart; j < jEnd; j++) {
+                            const uint8_t* rowPtr = basePtr + (size_t)j * rowBytes;
+                            for (size_t b = 0; b < blocksPerRow; ++b) {
+                                const uint8_t* blockPtr = rowPtr + b * blockSizeBytes;
+                                uint16_t d_raw;
+                                std::memcpy(&d_raw, blockPtr, 2);
+                                float d = FP16ToFloat(d_raw);
+                                const int8_t* qs = reinterpret_cast<const int8_t*>(blockPtr + 2);
+                                for (size_t i = 0; i < 32; ++i) {
+                                    row[b * 32 + i] = qs[i] * d;
+                                }
+                            }
+                            outLogits[j] = DotProductSIMD(x.data(), row.data(), hidden);
+                        }
+                    };
+                    if (nThreads == 1) {
+                        worker(0, vocab);
+                    } else {
+                        std::vector<std::thread> threads;
+                        threads.reserve(nThreads);
+                        for (int t = 0; t < nThreads; t++) {
+                            int jStart = t * chunk;
+                            int jEnd   = std::min(jStart + chunk, vocab);
+                            if (jStart < jEnd)
+                                threads.emplace_back(worker, jStart, jEnd);
+                        }
+                        for (auto& th : threads) th.join();
+                    }
                 }
 
                 m_cpuDispatchedOperators++;
@@ -700,23 +971,8 @@ namespace DirectLLM {
             }
         }
 
-        // ----------------------------------------------------------------
-        //  Last-resort vocabulary-based fallback (no weights loaded)
-        // ----------------------------------------------------------------
-        outLogits.assign(vocab, 0.0f);
-        int prevTok = (int)inputTokenIds.size() > 1 ? inputTokenIds[inputTokenIds.size() - 2] : tokId;
-        for (int i = 0; i < vocab; i++) {
-            int d = std::abs(i - tokId);
-            if      (d < 100)   outLogits[i] = (100.f   - d) * 0.05f;
-            else if (d < 1000)  outLogits[i] = (1000.f  - d) * 0.005f;
-            else if (d < 10000) outLogits[i] = (10000.f - d) * 0.0005f;
-        }
-        for (int i = 10; i < 200; i++) outLogits[i] += 0.3f;
-        for (int i = 0; i < vocab; i++) {
-            int d = std::abs(i - prevTok);
-            if (d < 50) outLogits[i] += (50.f - d) * 0.03f;
-        }
-        return true;
+        std::cerr << "[ModelPipeline] Error: Missing required embedding (token_embd/tok_embeddings) or output projection (output/lm_head) tensors in loaded GGUF weight map!" << std::endl;
+        return false;
     }
 
     // ================================================================
@@ -727,12 +983,14 @@ namespace DirectLLM {
         m_vramUsageBytes = m_systemRamUsageBytes = 0;
         m_gemmPSOReady = false;
         m_persistentHiddenBytes = m_persistentVocabBytes = 0;
+        m_dsLoader.Shutdown();
+        m_kvCache.Reset();
+        m_openVINO.Shutdown();
     }
 
     bool ModelPipeline::DispatchGPUMatrixMultiply(const Tensor& X, const Tensor& W, Tensor& Y) {
         if (!m_dxEngine || !m_gemmPSOReady) return false;
         m_gpuDispatchedOperators++;
-        // (Reuses cached PSO — no recompile)
         ComPtr<ID3D12CommandAllocator> alloc;
         ComPtr<ID3D12GraphicsCommandList> list;
         m_dxEngine->GetDevice()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&alloc));

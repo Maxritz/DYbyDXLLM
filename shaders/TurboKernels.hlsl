@@ -1,185 +1,299 @@
-// DirectLLM HLSL SM 6.6 / SM 6.7 - (C) 2026 DirectLLM Team
-// High Performance Fused Attention, MoE Routing, and TurboQuant dequantization layouts
+// DybyDx HLSL SM 6.6 - (C) 2026 DirectLLM Team
+// TurboKernels: dFlash (FlashAttention-2), dSpark (MoE top-K routing),
+//               TurboQuant (INT4 dequant)
+//
+// Wave size: [WaveSize(32)] forces Wave32 on all hardware.
+//   AMD RDNA 3/4 (9070 XT) supports Wave32 mode in compute via this attribute.
+//   Intel Arc (Xe-LPG, Core Ultra iGPU) natively Wave32.
+//   NVIDIA Ampere+ Wave32.
+//   => Consistent intrinsics, same dispatch on all machines.
+//
+// All kernels correctly WRITE their output (prior stubs did not).
 
-#define WAVE_SIZE 32 // Target AMD RDNA Wave32 and modern WaveIntrinsics
-#define COOPERATIVE_TILES_M 16
-#define COOPERATIVE_TILES_N 16
+// ============================================================
+//  [dflash] FlashAttention-2 (Online Softmax, Tiled QK^T V)
+//  Fuses attention score + softmax + weighted V sum in one pass.
+//  Avoids materialising the full N×N attention matrix in VRAM.
+//  Uses SM6.6 WaveIntrinsics for parallel max/sum reduction.
+// ============================================================
 
-// [dflash] - Fused FlashAttention compute pass
-// Reduces redundant global VRAM transactions by storing intermediate Q K^T attention scores in local shared memory (LDS).
-// Softmax is computed incrementally on-register using WaveActiveMax and WaveActiveSum.
+#define WARP_SIZE   32       // forced below with [WaveSize(32)]
+#define MAX_HEAD_DIM 128     // max head dimension supported
+
 struct AttentionConstants {
-    uint BatchSize;
-    uint NumHeads;
-    uint HeadDim;
-    uint SeqLen;
-    float ScaleMultiplier;
+    uint  BatchSize;
+    uint  NumHeads;
+    uint  HeadDim;    // actual head dimension (<=MAX_HEAD_DIM)
+    uint  SeqLen;
+    float InvSqrtD;  // 1/sqrt(HeadDim) pre-computed
 };
 
 ConstantBuffer<AttentionConstants> attnConfig : register(b0);
 
-StructuredBuffer<float16_t> QueryBuffer : register(t0);
-StructuredBuffer<float16_t> KeyBuffer : register(t1);
-StructuredBuffer<float16_t> ValueBuffer : register(t2);
-RWStructuredBuffer<float16_t> OutputBuffer : register(u0);
+StructuredBuffer<float>   QueryBuffer  : register(t0); // [Batch, Heads, Seq, HeadDim] FP32
+StructuredBuffer<float>   KeyBuffer    : register(t1);
+StructuredBuffer<float>   ValueBuffer  : register(t2);
+RWStructuredBuffer<float> AttnOutput   : register(u0); // [Batch, Heads, Seq, HeadDim] FP32
 
-groupshared float16_t tileAttentionScores[WAVE_SIZE][WAVE_SIZE];
+// One wave = one query position.
+// Grid: Dispatch(SeqLen, NumHeads, BatchSize)
+[WaveSize(32)]
+[numthreads(WARP_SIZE, 1, 1)]
+void FusedFlashAttentionKernel(uint3 dtid  : SV_DispatchThreadID,
+                                uint3 gtid  : SV_GroupThreadID,
+                                uint3 gid   : SV_GroupID) {
+    uint lane    = gtid.x;
+    uint qRow    = gid.x;   // query position in sequence
+    uint headIdx = gid.y;
+    uint batch   = gid.z;
 
-[numthreads(WAVE_SIZE, 1, 1)]
-void FusedFlashAttentionKernel(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID) {
-    uint tx = gtid.x; // lane index within wave (32 threads)
-    uint headIdx = dtid.y;
-    uint qRowIdx = dtid.x; // query sequence index
+    if (qRow >= attnConfig.SeqLen || headIdx >= attnConfig.NumHeads) return;
 
-    if (qRowIdx >= attnConfig.SeqLen) return;
+    uint headDim = attnConfig.HeadDim;
+    uint qBase   = ((batch * attnConfig.NumHeads + headIdx) * attnConfig.SeqLen + qRow) * headDim;
 
-    // Load Q vector elements directly into local registers
-    float q[64];
-    uint qBase = (qRowIdx * attnConfig.NumHeads + headIdx) * attnConfig.HeadDim;
-    for (uint i = 0; i < attnConfig.HeadDim; i += WAVE_SIZE) {
-        if (i + tx < attnConfig.HeadDim) {
-            q[(i + tx) / WAVE_SIZE] = (float)QueryBuffer[qBase + i + tx];
-        }
+    // Load Q into registers (each lane holds a slice; loop for headDim > WARP_SIZE)
+    float q[MAX_HEAD_DIM / WARP_SIZE]; // each lane holds headDim/WARP_SIZE elements
+    uint elementsPerLane = (headDim + WARP_SIZE - 1) / WARP_SIZE;
+    for (uint e = 0; e < elementsPerLane; ++e) {
+        uint d = lane + e * WARP_SIZE;
+        q[e] = (d < headDim) ? QueryBuffer[qBase + d] : 0.0f;
     }
 
-    float runningMax = -999999.0f;
+    // Online softmax state
+    float runningMax = -1e30f;
     float runningSum = 0.0f;
-    float acc[64]; // running output numerator vector (O)
-    for (uint d = 0; d < attnConfig.HeadDim; ++d) {
-        acc[d] = 0.0f;
-    }
 
-    // Block-wise Key-Value tile loops over the sequence dimension
-    uint numTiles = (attnConfig.SeqLen + WAVE_SIZE - 1) / WAVE_SIZE;
-    for (uint tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
-        uint kColIdx = tileIdx * WAVE_SIZE + tx;
+    float acc[MAX_HEAD_DIM / WARP_SIZE];
+    for (uint e = 0; e < elementsPerLane; ++e) acc[e] = 0.0f;
 
-        // Load K vector tile into register memory
-        float k[64];
-        uint kBase = (kColIdx * attnConfig.NumHeads + headIdx) * attnConfig.HeadDim;
-        if (kColIdx < attnConfig.SeqLen) {
-            for (uint i = 0; i < attnConfig.HeadDim; ++i) {
-                k[i] = (float)KeyBuffer[kBase + i];
-            }
-        }
+    uint numKVTiles = (attnConfig.SeqLen + WARP_SIZE - 1) / WARP_SIZE;
 
-        // Calculate Dot Product Q * K^T
+    for (uint tileIdx = 0; tileIdx < numKVTiles; ++tileIdx) {
+        uint kPos  = tileIdx * WARP_SIZE + lane; // key position this lane handles
+
+        // ---- QK dot product ----
+        // Each lane computes dot(Q[qRow], K[kPos]) cooperatively.
+        // We need every lane to have the full score for its kPos.
         float score = 0.0f;
-        for (uint i = 0; i < attnConfig.HeadDim; ++i) {
-            score += q[i] * k[i];
+        if (kPos < attnConfig.SeqLen) {
+            uint kBase = ((batch * attnConfig.NumHeads + headIdx) * attnConfig.SeqLen + kPos) * headDim;
+            for (uint e = 0; e < elementsPerLane; ++e) {
+                uint d = lane + e * WARP_SIZE;
+                if (d < headDim) score += q[e] * KeyBuffer[kBase + d];
+            }
+            // Sum partial dot products across all lanes (each computes different d elements)
+            score = WaveActiveSum(score) * attnConfig.InvSqrtD;
+            // Causal mask: future tokens get -inf
+            if (kPos > qRow) score = -1e30f;
+        } else {
+            score = -1e30f;
         }
-        score *= attnConfig.ScaleMultiplier;
 
-        // Dynamic Causal masking constraint
-        if (kColIdx > qRowIdx) {
-            score = -999999.0f;
-        }
+        // ---- Online softmax update (FlashAttention-2 style) ----
+        float tileMax = WaveActiveMax(score);
+        float newMax  = max(runningMax, tileMax);
 
-        // Parallel Wave-level incremental softmax (SM6.6 WaveIntrinsics)
-        float maxScore = WaveActiveMax(score);
-        float nextMax = max(runningMax, maxScore);
+        float p         = exp(score    - newMax); // softmax numerator for this kPos
+        float rescale   = exp(runningMax - newMax);
 
-        float scaleCurrent = exp(score - nextMax);
-        float scaleRunning = exp(runningMax - nextMax);
+        float tileSum   = WaveActiveSum(p);
 
-        float sumCurrent = WaveActiveSum(scaleCurrent);
-        runningSum = runningSum * scaleRunning + sumCurrent;
-        runningMax = nextMax;
+        runningSum = runningSum * rescale + tileSum;
+        runningMax = newMax;
 
-        // Accumulate weighted V tile elements directly in register storage
-        uint vBase = (kColIdx * attnConfig.NumHeads + headIdx) * attnConfig.HeadDim;
-        for (uint d = 0; d < attnConfig.HeadDim; ++d) {
-            float vVal = (kColIdx < attnConfig.SeqLen) ? (float)ValueBuffer[vBase + d] : 0.0f;
-            acc[d] = acc[d] * scaleRunning + scaleCurrent * vVal;
+        // ---- Weighted V accumulation ----
+        if (kPos < attnConfig.SeqLen) {
+            uint vBase = ((batch * attnConfig.NumHeads + headIdx) * attnConfig.SeqLen + kPos) * headDim;
+            for (uint e = 0; e < elementsPerLane; ++e) {
+                uint d = lane + e * WARP_SIZE;
+                float vVal = (d < headDim) ? ValueBuffer[vBase + d] : 0.0f;
+                acc[e] = acc[e] * rescale + p * vVal;
+            }
+        } else {
+            for (uint e = 0; e < elementsPerLane; ++e)
+                acc[e] = acc[e] * rescale;
         }
     }
 
-    // Normalize final output sequence tile and write back to output buffer
-    uint outBase = (qRowIdx * attnConfig.NumHeads + headIdx) * attnConfig.HeadDim;
-    for (uint d = 0; d < attnConfig.HeadDim; ++d) {
-        if (runningSum > 0.0f) {
-            OutputBuffer[outBase + d] = (float16_t)(acc[d] / runningSum);
-        }
+    // ---- Write normalised output ----
+    float invSum = (runningSum > 0.0f) ? (1.0f / runningSum) : 0.0f;
+    uint outBase = ((batch * attnConfig.NumHeads + headIdx) * attnConfig.SeqLen + qRow) * headDim;
+    for (uint e = 0; e < elementsPerLane; ++e) {
+        uint d = lane + e * WARP_SIZE;
+        if (d < headDim)
+            AttnOutput[outBase + d] = acc[e] * invSum;
     }
 }
 
-// [dspark] - Sparse MoE Top-K gating and routing kernel
-// Computes logits for each expert token, routes tokens to active expert streams, and executes offload handles.
-struct MoEConfig {
-    uint NumExperts;
-    uint ActiveExpertsK; // Top-K gating (usually 2)
-    uint ExpertDim;
+
+// ============================================================
+//  [dspark] Sparse MoE Top-K Gating & Routing Kernel
+//  Correct formulation:
+//    logit[e] = dot(HiddenState[token], GateWeights[expert_e])
+//    top-K selection via parallel reduction
+//    softmax over top-K logits
+//    writes expert indices + normalised gating weights
+//
+//  Supports up to 256 experts (DeepSeek V3 scale).
+//  One thread group per token.
+// ============================================================
+
+#define MAX_EXPERTS 256
+#define DSPARK_THREADS 64
+
+struct MoEConstants {
+    uint NumTokens;
+    uint NumExperts;    // total experts (e.g. 256 for DeepSeek)
+    uint ActiveK;       // top-K (e.g. 2 for Mixtral, 6 for DeepSeek)
+    uint HiddenDim;     // hidden state dimension
 };
 
-ConstantBuffer<MoEConfig> moeConfig : register(b1);
-StructuredBuffer<float16_t> GateWeights : register(t3);
+ConstantBuffer<MoEConstants> moeConst : register(b1);
 
-[numthreads(64, 1, 1)]
-void SparseMoERoutingKernel(uint3 dtid : SV_DispatchThreadID) {
-    uint tokenIdx = dtid.x;
-    
-    // Perform matrix-vector multiply with expert gating weights to find top-K logits
-    float logits[8]; // supporting up to 8 experts in Mixtral configuration
-    for (uint e = 0; e < moeConfig.NumExperts; ++e) {
-        float logit = 0.0f;
-        for (uint d = 0; d < moeConfig.ExpertDim; ++d) {
-            logit += (float)GateWeights[tokenIdx * moeConfig.ExpertDim + d] * (float)GateWeights[e * moeConfig.ExpertDim + d];
+StructuredBuffer<float>   HiddenStates : register(t3); // [NumTokens, HiddenDim]
+StructuredBuffer<float>   GateWeights  : register(t4); // [NumExperts, HiddenDim]
+
+// Output: for each token, ActiveK expert IDs and their normalised weights
+RWStructuredBuffer<uint>  ExpertIds    : register(u1); // [NumTokens, ActiveK]
+RWStructuredBuffer<float> ExpertWeights : register(u2); // [NumTokens, ActiveK]
+
+groupshared float gs_logits[MAX_EXPERTS];
+groupshared uint  gs_topIds[8];       // support up to top-8
+groupshared float gs_topWeights[8];
+
+[WaveSize(32)]
+[numthreads(DSPARK_THREADS, 1, 1)]
+void SparseMoERoutingKernel(uint3 gid  : SV_GroupID,
+                              uint3 gtid : SV_GroupThreadID) {
+    uint tokenIdx = gid.x;
+    uint tid      = gtid.x;
+
+    if (tokenIdx >= moeConst.NumTokens) return;
+
+    // ---- 1. Compute logit for every expert: logit[e] = h · W_gate[e] ----
+    // Threads cooperate: each thread handles a chunk of experts.
+    uint expertsPerThread = (moeConst.NumExperts + DSPARK_THREADS - 1) / DSPARK_THREADS;
+    uint eStart = tid * expertsPerThread;
+    uint eEnd   = min(eStart + expertsPerThread, moeConst.NumExperts);
+
+    for (uint e = eStart; e < eEnd; ++e) {
+        float dot = 0.0f;
+        uint hBase = tokenIdx * moeConst.HiddenDim;
+        uint gBase = e        * moeConst.HiddenDim;
+        // Inner loop: dot product of hidden state with expert gate row
+        for (uint d = 0; d < moeConst.HiddenDim; d += 4) {
+            float h0 = HiddenStates[hBase + d + 0];
+            float h1 = (d+1 < moeConst.HiddenDim) ? HiddenStates[hBase + d + 1] : 0.0f;
+            float h2 = (d+2 < moeConst.HiddenDim) ? HiddenStates[hBase + d + 2] : 0.0f;
+            float h3 = (d+3 < moeConst.HiddenDim) ? HiddenStates[hBase + d + 3] : 0.0f;
+            dot += h0 * GateWeights[gBase + d + 0]
+                 + h1 * GateWeights[gBase + d + 1]
+                 + h2 * GateWeights[gBase + d + 2]
+                 + h3 * GateWeights[gBase + d + 3];
         }
-        logits[e] = logit;
+        gs_logits[e] = dot;
     }
 
-    // Sort logits to find top-K active expert IDs (usually top-1 or top-2)
-    uint topExperts[2] = { 0, 0 };
-    float topWeights[2] = { -9999.0f, -9999.0f };
+    GroupMemoryBarrierWithGroupSync();
 
-    for (uint k = 0; k < moeConfig.ActiveExpertsK; ++k) {
-        float maxVal = -9999.0f;
-        uint maxIdx = 0;
-        for (uint e = 0; e < moeConfig.NumExperts; ++e) {
-            bool alreadySelected = false;
-            for (uint prev = 0; prev < k; ++prev) {
-                if (topExperts[prev] == e) alreadySelected = true;
+    // ---- 2. Top-K selection (thread 0 does sequential scan) ----
+    // For ActiveK <= 8, this is fast. Could parallelise for K > 8.
+    if (tid == 0) {
+        for (uint k = 0; k < moeConst.ActiveK && k < 8; ++k) {
+            float best    = -1e30f;
+            uint  bestIdx = 0;
+            for (uint e = 0; e < moeConst.NumExperts; ++e) {
+                // Skip already selected experts
+                bool skip = false;
+                for (uint prev = 0; prev < k; ++prev)
+                    if (gs_topIds[prev] == e) { skip = true; break; }
+                if (!skip && gs_logits[e] > best) {
+                    best    = gs_logits[e];
+                    bestIdx = e;
+                }
             }
-            if (!alreadySelected && logits[e] > maxVal) {
-                maxVal = logits[e];
-                maxIdx = e;
-            }
+            gs_topIds[k]     = bestIdx;
+            gs_topWeights[k] = best;
         }
-        topExperts[k] = maxIdx;
-        topWeights[k] = maxVal;
+
+        // ---- 3. Softmax over top-K logits ----
+        float maxW = gs_topWeights[0];
+        for (uint k = 1; k < moeConst.ActiveK && k < 8; ++k)
+            maxW = max(maxW, gs_topWeights[k]);
+
+        float sumExp = 0.0f;
+        for (uint k = 0; k < moeConst.ActiveK && k < 8; ++k) {
+            gs_topWeights[k] = exp(gs_topWeights[k] - maxW);
+            sumExp += gs_topWeights[k];
+        }
+        float invSum = (sumExp > 0.0f) ? (1.0f / sumExp) : 0.0f;
+        for (uint k = 0; k < moeConst.ActiveK && k < 8; ++k)
+            gs_topWeights[k] *= invSum;
+
+        // ---- 4. Write outputs ----
+        uint outBase = tokenIdx * moeConst.ActiveK;
+        for (uint k = 0; k < moeConst.ActiveK && k < 8; ++k) {
+            ExpertIds[outBase + k]     = gs_topIds[k];
+            ExpertWeights[outBase + k] = gs_topWeights[k];
+        }
     }
-
-    // Apply Softmax scaling over chosen top-K gate weights
-    float sumExp = exp(topWeights[0]) + exp(topWeights[1]);
-    float finalGatingWeight0 = exp(topWeights[0]) / sumExp;
-    float finalGatingWeight1 = exp(topWeights[1]) / sumExp;
-
-    // Output routing matrix indexes (simulating token dispatch)
-    // Marks expert destination allocations for the multi-GPU or System memory host offloader queues
 }
 
-// [turboquant] - Ultra-fast block-compressed sub-byte scaling
-// Demonstrates how DirectLLM supports hybrid sub-byte formats with dequantization structures.
-StructuredBuffer<uint> CompressedSubByteWeights : register(t4);
-StructuredBuffer<float16_t> BlockScales : register(t5);
 
-[numthreads(16, 16, 1)]
+// ============================================================
+//  [turboquant] INT4 Block-Wise Dequantization Kernel
+//  Unpacks Q4_0 / Q4_K packed weights -> FP32 output.
+//  Supports arbitrary matrix dimensions via constants.
+//  Each thread unpacks one packed uint (8 weights).
+// ============================================================
+
+struct TurboQuantConstants {
+    uint NumRows;         // weight matrix rows (vocab or hidden)
+    uint NumCols;         // weight matrix cols (hidden or intermediate)
+    uint GroupSize;       // quantisation group size (e.g. 32)
+};
+
+ConstantBuffer<TurboQuantConstants> tqConst : register(b2);
+
+StructuredBuffer<uint>   TQ_PackedWeights : register(t5); // INT4 packed: 8 weights per uint
+StructuredBuffer<float>  TQ_Scales        : register(t6); // one scale per group
+StructuredBuffer<float>  TQ_ZeroPoints    : register(t7); // one zero-point per group (packed INT4)
+
+RWStructuredBuffer<float> TQ_Output       : register(u3); // dequantised FP32 weights
+
+// Each thread handles 8 weights (one uint).
+// Dispatch: ceil(NumRows * NumCols / 8) threads
+[WaveSize(32)]
+[numthreads(64, 1, 1)]
 void TurboQuantDequantKernel(uint3 dtid : SV_DispatchThreadID) {
-    uint colIdx = dtid.x;
-    uint rowIdx = dtid.y;
+    uint packedIdx = dtid.x; // index into PackedWeights array
+    uint totalPacked = (tqConst.NumRows * tqConst.NumCols + 7) / 8;
+    if (packedIdx >= totalPacked) return;
 
-    // Sub-byte weight compression unpacking logic (block-compressed q4_0 layouts)
-    // Every uint contains 8 packed 4-bit weights.
-    uint packedIndex = (rowIdx * 1024 + colIdx) / 8;
-    uint subOffset = (colIdx % 8) * 4;
+    uint packed = TQ_PackedWeights[packedIdx];
 
-    uint packedWeights = CompressedSubByteWeights[packedIndex];
-    uint raw4BitWeight = (packedWeights >> subOffset) & 0x0F;
+    // Unpack 8 INT4 values (nibbles)
+    uint baseElemIdx = packedIdx * 8;
 
-    // Apply scaling and zero-point offset mapping (reconstruct float16)
-    float16_t scaleMultiplier = BlockScales[rowIdx * (1024 / 32) + (colIdx / 32)];
-    float dequantVal = ((float)raw4BitWeight - 8.0f) * (float)scaleMultiplier;
+    for (uint i = 0; i < 8; ++i) {
+        uint elemIdx = baseElemIdx + i;
+        if (elemIdx >= tqConst.NumRows * tqConst.NumCols) break;
 
-    // Store uncompressed floating points in local cache line
-    // Simulates matrix operations or immediate registry buffer caching
+        // Extract nibble i from the packed uint
+        uint nibble = (packed >> (i * 4)) & 0x0F;
+
+        // Find which group this element belongs to
+        uint groupIdx = elemIdx / tqConst.GroupSize;
+        float scale = TQ_Scales[groupIdx];
+
+        // Zero-point: packed as INT4 in TQ_ZeroPoints
+        uint zpPacked = TQ_ZeroPoints[groupIdx / 2];
+        float zp = (float)((groupIdx & 1) ? (zpPacked >> 4) & 0x0F : zpPacked & 0x0F);
+
+        // Dequantize: w_float = (nibble - zp) * scale
+        float dequant = ((float)nibble - zp) * scale;
+
+        TQ_Output[elemIdx] = dequant;
+    }
 }

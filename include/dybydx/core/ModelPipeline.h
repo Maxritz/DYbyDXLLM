@@ -9,6 +9,9 @@
 #include <memory>
 #include "dybydx/core/DirectXEngine.h"
 #include "dybydx/core/KVCacheManager.h"
+#include "dybydx/core/DirectStorageLoader.h"
+#include "dybydx/core/IntelOpenVINOInterop.h"
+#include "dybydx/core/AdvancedVendorOptimizations.h"
 
 namespace DirectLLM {
 
@@ -49,20 +52,15 @@ namespace DirectLLM {
         CPU_SystemRAM     // System memory offloaded via PCIe/Host-Visible Heap
     };
 
-    // Representing a tensor descriptor and its backing data
     struct Tensor {
         std::string Name;
         std::vector<size_t> Shape;
         QuantizationType QuantType;
         DeviceLocation Location;
         
-        // GPU Resource Handles
         ComPtr<ID3D12Resource> GPUResource;
-        
-        // Host RAM backup for offloaded split execution
         std::vector<uint8_t> CPUHostData;
         
-        // Scale and zero points for block-wise quantization
         ComPtr<ID3D12Resource> GPUScales;
         ComPtr<ID3D12Resource> GPUZeroPoints;
         std::vector<float16_t> CPUScales;
@@ -71,49 +69,44 @@ namespace DirectLLM {
         size_t GetSizeInBytes() const;
     };
 
-    // Architecture config for Dense and MoE weights
     struct ModelConfig {
         ModelArchitecture Arch = ModelArchitecture::Llama;
         ModelType Type = ModelType::Dense;
         std::wstring ModelName;
         size_t NumLayers = 32;
         size_t HiddenDim = 4096;
-        size_t IntermediateDim = 11008; // FFN dimension
+        size_t IntermediateDim = 11008;
         size_t NumHeads = 32;
         size_t HeadDim = 128;
         size_t VocabSize = 32000;
         
-        // Quantization Configurations
         QuantizationType WeightQuantType = QuantizationType::Q4_K;
         KVCacheQuantType CacheQuantType = KVCacheQuantType::None_FP16;
         
-        // MoE parameters (only used if Type == MixtureOfExperts)
         size_t NumExperts = 8;
-        size_t ActiveExpertsK = 2; // e.g. Top-2 Routing
+        size_t ActiveExpertsK = 2;
         
-        // Memory partition config (Split Layer Architecture)
-        float VramAllocationLimitMB = 6000.0f; // Max VRAM budget allowed
+        float VramAllocationLimitMB = 6000.0f;
         bool EnableSystemRamOffload = true;
+
+        bool ForceStreamMode     = false;
+        bool UseMetadataOnlyLoad = false;
     };
 
-    // A single transformer layer containing weights split across CPU or GPU
     struct TransformerLayer {
         size_t LayerIndex;
-        DeviceLocation PrimaryLocation; // Location of the main FFN/Attention layers
+        DeviceLocation PrimaryLocation;
         
-        // Attention projections
         Tensor QKV_Proj;
         Tensor O_Proj;
 
-        // Feed-Forward Networks (Dense Models)
         Tensor FFN_Gate_Proj;
         Tensor FFN_Up_Proj;
         Tensor FFN_Down_Proj;
 
-        // Mixture of Experts (MoE Models)
-        Tensor MoE_Gate; // Router weights (usually kept in VRAM for fast evaluation)
-        std::vector<Tensor> Experts; // List of active experts (dense MLP layers)
-        std::vector<DeviceLocation> ExpertLocations; // Each expert can be individually pinned to CPU or GPU
+        Tensor MoE_Gate;
+        std::vector<Tensor> Experts;
+        std::vector<DeviceLocation> ExpertLocations;
     };
 
     class ModelPipeline {
@@ -123,24 +116,29 @@ namespace DirectLLM {
 
         bool Initialize(DirectXEngine* dxEngine, const ModelConfig& config);
         
-        // Split-layer engine: loads parts of weights to VRAM and offloads remaining to host memory
         bool LoadModelWeights(const std::wstring& weightsPath);
+
+        bool LoadOpenVinoIR(const std::string& xmlPath, const std::string& binPath, const std::string& deviceTarget = "") {
+            return m_openVINO.LoadModelIR(xmlPath, binPath, deviceTarget);
+        }
         
-        // Forward pass evaluation: dynamically orchestrates CPU and GPU dispatches
         bool RunInferenceStep(uint32_t batchSize, 
-                              const std::vector<int32_t>& inputTokenIds, 
-                              uint32_t currentSequenceOffset,
-                              std::vector<float>& outLogits);
+                               const std::vector<int32_t>& inputTokenIds, 
+                               uint32_t currentSequenceOffset,
+                               std::vector<float>& outLogits);
 
         void Reset();
         
-        // Diagnostic metrics
         size_t GetTotalVramUsageInBytes() const { return m_vramUsageBytes; }
         size_t GetTotalSystemRamUsageInBytes() const { return m_systemRamUsageBytes; }
         float GetGpuExecutionRatio() const;
 
+        KVCacheManager& GetKVCache() { return m_kvCache; }
+        IntelOpenVINOInterop& GetOpenVINO() { return m_openVINO; }
+        DirectStorageLoader& GetDirectStorage() { return m_dsLoader; }
+        AdvancedVendorOptimizations& GetOptimizations() { return m_opts; }
+
     private:
-        // CPU SIMD capabilities — detected once at Initialize time
         bool m_hasAVX512F    = false;
         bool m_hasAVX2       = false;
         bool m_hasAVX        = false;
@@ -151,49 +149,46 @@ namespace DirectLLM {
         ModelConfig m_config;
         std::vector<TransformerLayer> m_layers;
         
-        // GGUF-loaded weight tensors
         std::unordered_map<std::string, Tensor> m_weightTensors;
         
-        // Global word embedding and final language-model head
         Tensor m_embedTokens;
         Tensor m_lmHead;
 
-        // Memory counters
+        // Subsystems
+        DirectStorageLoader  m_dsLoader;
+        KVCacheManager       m_kvCache;
+        IntelOpenVINOInterop m_openVINO;
+        AdvancedVendorOptimizations m_opts;
+
         size_t m_vramUsageBytes = 0;
         size_t m_systemRamUsageBytes = 0;
         size_t m_gpuDispatchedOperators = 0;
         size_t m_cpuDispatchedOperators = 0;
 
-        // Staging buffer used to stream offloaded CPU weights into VRAM dynamically if needed
         ComPtr<ID3D12Resource> m_gpuStagingBuffer;
-        size_t m_stagingBufferSize = 1024 * 1024 * 256; // 256 MB streaming window
+        size_t m_stagingBufferSize = 1024 * 1024 * 256;
 
-        // Helper functions
         bool AllocateTensor(Tensor& tensor, size_t sizeInBytes, DeviceLocation location);
         bool DispatchGPUMatrixMultiply(const Tensor& X, const Tensor& W, Tensor& Y);
         bool DispatchCPUMatrixMultiply(const Tensor& X, const Tensor& W, Tensor& Y);
         bool DispatchMoERouting(const Tensor& X, const TransformerLayer& layer, std::vector<float>& expertWeights, std::vector<std::vector<uint32_t>>& expertTokens);
         
-        // Command recording contexts
         ComPtr<ID3D12CommandAllocator> m_cmdAllocator;
         ComPtr<ID3D12GraphicsCommandList> m_cmdList;
         ComPtr<ID3D12Fence> m_executionFence;
         UINT64 m_fenceValue = 0;
 
-        // Cached GEMM pipeline state — compiled once after LoadModelWeights, reused every token
         ComPtr<ID3D12RootSignature> m_gemmRootSignature;
         ComPtr<ID3D12PipelineState> m_gemmPSO;
         bool m_gemmPSOReady = false;
 
-        // Persistent per-step GPU buffers (avoids per-token alloc/free)
-        ComPtr<ID3D12Resource> m_xUploadBuffer;   // UPLOAD heap: CPU->GPU for embedding vector X
-        ComPtr<ID3D12Resource> m_xGPUBuffer;      // DEFAULT heap: X on GPU
-        ComPtr<ID3D12Resource> m_yGPUBuffer;      // DEFAULT heap: Y (logits) on GPU
-        ComPtr<ID3D12Resource> m_yReadbackBuffer; // READBACK heap: GPU->CPU for logits
+        ComPtr<ID3D12Resource> m_xUploadBuffer;
+        ComPtr<ID3D12Resource> m_xGPUBuffer;
+        ComPtr<ID3D12Resource> m_yGPUBuffer;
+        ComPtr<ID3D12Resource> m_yReadbackBuffer;
         size_t m_persistentHiddenBytes = 0;
         size_t m_persistentVocabBytes  = 0;
 
-        // Dedicated command allocator + list for inference (reset each step, not recreated)
         ComPtr<ID3D12CommandAllocator> m_inferCmdAllocator;
         ComPtr<ID3D12GraphicsCommandList> m_inferCmdList;
         ComPtr<ID3D12Fence> m_inferFence;
@@ -203,7 +198,6 @@ namespace DirectLLM {
         bool BuildGEMMPipeline();
         bool EnsurePersistentBuffers(size_t hiddenBytes, size_t vocabBytes);
 
-        // SIMD-accelerated dot products (dispatched at runtime based on m_hasAVX*)
         float DotProductSIMD(const float* a, const float* b, int n) const;
 
         void WaitForGPU();

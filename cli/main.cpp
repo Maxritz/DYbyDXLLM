@@ -6,10 +6,13 @@
 
 #include <iostream>
 #include <string>
+#include <fstream>
 #include <vector>
 #include <chrono>
 #include <sstream>
 #include <iomanip>
+#include <random>
+#include <algorithm>
 
 using namespace DirectLLM;
 
@@ -27,6 +30,9 @@ struct CliOptions {
     bool enableMtp = false;
     std::string kvQuant = "fp16";
     float vramLimit = 2048.0f;
+    bool forceStream = false;
+    bool metadataOnly = false;
+    std::string outputPath; // Path for generated essay
 };
 
 static std::string timestamp() {
@@ -58,6 +64,8 @@ static void printHelp() {
     std::cout << "  --enable-mtp             Enable Multi-Token Prediction (speculative decoding)" << std::endl;
     std::cout << "  --kv-quant <type>        KV cache quantization: fp32, fp16, fp8, int8, int4 (default fp16)" << std::endl;
     std::cout << "  --vram-limit <MB>        VRAM allocation limit in MB (default 2048)" << std::endl;
+    std::cout << "  --force-stream           Force streaming decode even on dense models" << std::endl;
+    std::cout << "  --metadata-only          Skip weight loading; read GGUF metadata only (for 100 GB+ models)" << std::endl;
     std::cout << "  -verbose                 Detailed tracing" << std::endl;
     std::cout << "  -h, --help               This help" << std::endl;
 }
@@ -80,13 +88,53 @@ static CliOptions parseArgs(int argc, char* argv[]) {
         else if (arg == "--enable-mtp") opts.enableMtp = true;
         else if (arg == "--kv-quant" && i + 1 < argc) opts.kvQuant = argv[++i];
         else if (arg == "--vram-limit" && i + 1 < argc) opts.vramLimit = std::stof(argv[++i]);
+        else if (arg == "--force-stream") opts.forceStream = true;
+        else if (arg == "--metadata-only") opts.metadataOnly = true;
+        else if (arg == "--output" && i + 1 < argc) opts.outputPath = argv[++i];
     }
     return opts;
 }
 
+// Same O(n) sampler as ModelPipeline for local main sampling
+static int LocalSample(float* logits, int vocabSize, float temp, float topP, int topK) {
+    if (temp < 0.001f) temp = 0.001f;
+    for (int i = 0; i < vocabSize; i++) logits[i] /= temp;
+
+    std::vector<std::pair<float, int>> scored;
+    scored.reserve(vocabSize);
+    for (int i = 0; i < vocabSize; i++) scored.emplace_back(logits[i], i);
+
+    int effectiveK = (topK > 0 && topK < vocabSize) ? topK : vocabSize;
+    std::nth_element(scored.begin(), scored.begin() + effectiveK, scored.end(),
+                     [](auto& a, auto& b) { return a.first > b.first; });
+    scored.resize(effectiveK);
+    std::sort(scored.begin(), scored.end(),
+              [](auto& a, auto& b) { return a.first > b.first; });
+
+    float maxVal = scored[0].first;
+    float sum = 0.0f;
+    for (auto& s : scored) { s.first = std::exp(s.first - maxVal); sum += s.first; }
+    for (auto& s : scored) s.first /= sum;
+
+    if (topP > 0.0f && topP < 1.0f) {
+        float cum = 0.0f; size_t cut = scored.size();
+        for (size_t i = 0; i < scored.size(); i++) {
+            cum += scored[i].first;
+            if (cum >= topP) { cut = i + 1; break; }
+        }
+        scored.resize(cut);
+    }
+
+    static std::mt19937 gen(std::random_device{}());
+    std::uniform_real_distribution<float> dist(0.f, 1.f);
+    float r = dist(gen), cdf = 0.f;
+    for (auto& s : scored) { cdf += s.first; if (r <= cdf) return s.second; }
+    return scored.empty() ? 0 : scored.back().second;
+}
+
 int main(int argc, char* argv[]) {
     auto opts = parseArgs(argc, argv);
-    auto startTime = std::chrono::high_resolution_clock::now();
+    auto loadStartTime = std::chrono::high_resolution_clock::now();
 
     log("CLI", "DybyDx v1.0.0 starting");
 
@@ -98,47 +146,63 @@ int main(int argc, char* argv[]) {
     if (engineOk) {
         auto& caps = engine.GetCaps();
         std::wstring name = caps.DeviceName;
-        log("DX12", std::string(name.begin(), name.end()) + " | VRAM: " +
-            std::to_string(caps.DedicatedVRAM / (1024 * 1024)) + " MB");
+        std::string nameStr(name.begin(), name.end());
+        log("DX12", nameStr + " | VRAM: " +
+            std::to_string(caps.DedicatedVRAM / (1024 * 1024)) + " MB" +
+            " | ReBAR: " + (caps.SupportsReBAR ? "YES" : "NO"));
     } else {
         log("DX12", "No device.", "WARN");
     }
 
-    // 2. Load model
+    // 2. Load model — REQUIRED. Abort if not found or fails to parse.
     if (opts.modelPath.empty()) {
-        log("CLI", "No model specified (--model). Use fallback mode.", "WARN");
+        log("CLI", "No --model specified. Aborting.", "ERROR");
+        return 1;
     }
 
     GgufLoader ggufLoader;
     bool modelLoaded = false;
 
-    if (!opts.modelPath.empty()) {
-        log("Model", "Loading " + opts.modelPath + "...");
-        modelLoaded = ggufLoader.LoadFile(opts.modelPath);
-        if (modelLoaded) {
-            log("Model", "GGUF v" + std::to_string(ggufLoader.GetVersion()) +
-                " | " + std::to_string(ggufLoader.GetTensorCount()) + " tensors");
-            if (ggufLoader.HasMetadata("general.architecture"))
-                log("Model", "Arch: " + ggufLoader.GetMetadataString("general.architecture"));
-            if (ggufLoader.HasMetadata("llama.embedding_length"))
-                log("Model", "Dim: " + std::to_string(ggufLoader.GetMetadataUint32("llama.embedding_length")));
+    {
+        if (opts.metadataOnly) {
+            log("Model", "Parsing metadata only from " + opts.modelPath + "...");
+            modelLoaded = ggufLoader.LoadMetadataOnly(opts.modelPath);
         } else {
-            log("Model", "Failed to load model.", "ERROR");
+            log("Model", "Loading " + opts.modelPath + "...");
+            modelLoaded = ggufLoader.LoadFile(opts.modelPath);
         }
+        if (!modelLoaded) {
+            log("Model", "FAILED to open/parse: " + opts.modelPath, "ERROR");
+            log("Model", "Check the path exists and is a valid GGUF file. Aborting.", "ERROR");
+            return 1;   // <-- hard stop: no fake output
+        }
+        log("Model", "GGUF v" + std::to_string(ggufLoader.GetVersion()) +
+            " | " + std::to_string(ggufLoader.GetTensorCount()) + " tensors");
+        if (ggufLoader.HasMetadata("general.architecture"))
+            log("Model", "Arch: " + ggufLoader.GetMetadataString("general.architecture"));
+        if (ggufLoader.HasMetadata("llama.embedding_length"))
+            log("Model", "Dim: " + std::to_string(ggufLoader.GetMetadataUint32("llama.embedding_length")));
     }
 
     // 3. Tokenizer
     BpeTokenizer tokenizer;
+    std::string modelArch = "";
     if (modelLoaded) {
         tokenizer.LoadFromGGUF(ggufLoader);
+        if (ggufLoader.HasMetadata("general.architecture"))
+            modelArch = ggufLoader.GetMetadataString("general.architecture");
     } else {
         tokenizer.LoadVocabulary("vocab.txt");
     }
 
-    auto promptTokens = tokenizer.Encode(opts.prompt);
+    // Wrap prompt in instruct template so the model generates proper text
+    std::string formattedPrompt = tokenizer.ApplyChatTemplate(opts.prompt, modelArch);
+    log("Tokenizer", "Chat template arch: " + (modelArch.empty() ? "(none)" : modelArch));
+
+    auto promptTokens = tokenizer.Encode(formattedPrompt);
     log("Tokenizer", std::to_string(promptTokens.size()) + " tokens from prompt");
 
-    // 4. Pipeline
+    // 4. Pipeline Config
     ModelPipeline pipeline;
     ModelConfig config;
     
@@ -149,14 +213,34 @@ int main(int argc, char* argv[]) {
     else if (opts.kvQuant == "int4") config.CacheQuantType = KVCacheQuantType::INT4;
     
     config.VramAllocationLimitMB = opts.vramLimit;
+    config.ForceStreamMode = opts.forceStream;
+    config.UseMetadataOnlyLoad = opts.metadataOnly;
 
     if (modelLoaded) {
         if (ggufLoader.HasMetadata("general.architecture")) {
             std::string arch = ggufLoader.GetMetadataString("general.architecture");
             if (arch == "laguna") {
                 config.Arch = ModelArchitecture::Laguna;
+            } else if (arch == "llama") {
+                config.Arch = ModelArchitecture::Llama;
+            } else if (arch == "phi") {
+                config.Arch = ModelArchitecture::Phi;
+            } else if (arch == "gemma") {
+                config.Arch = ModelArchitecture::Gemma;
+            } else if (arch == "deepseek") {
+                config.Arch = ModelArchitecture::DeepSeek;
             }
         }
+        
+        // MoE check
+        if (ggufLoader.HasMetadata("llama.expert_count") || ggufLoader.HasMetadata("deepseek.expert_count")) {
+            config.Type = ModelType::MixtureOfExperts;
+            config.NumExperts = ggufLoader.HasMetadata("llama.expert_count") ? 
+                                ggufLoader.GetMetadataUint32("llama.expert_count") : 256;
+            config.ActiveExpertsK = ggufLoader.HasMetadata("llama.expert_used_count") ?
+                                    ggufLoader.GetMetadataUint32("llama.expert_used_count") : 2;
+        }
+
         if (ggufLoader.HasMetadata("llama.block_count"))
             config.NumLayers = ggufLoader.GetMetadataUint32("llama.block_count");
         if (ggufLoader.HasMetadata("llama.embedding_length"))
@@ -174,11 +258,21 @@ int main(int argc, char* argv[]) {
             config.VocabSize = (size_t)tokEmb->Shape[0];
     }
 
-    pipeline.Initialize(engineOk ? &engine : nullptr, config);
-    if (modelLoaded)
-        pipeline.LoadModelWeights(std::wstring(opts.modelPath.begin(), opts.modelPath.end()));
+    // Force Stream dense check warning
+    if (config.ForceStreamMode && config.Type == ModelType::Dense) {
+        log("Model", "WARNING: --force-stream enabled on a dense model. Generation will be slow!", "WARN");
+    }
 
-    // 5. Inference loop
+    pipeline.Initialize(engineOk ? &engine : nullptr, config);
+    if (modelLoaded) {
+        pipeline.LoadModelWeights(std::wstring(opts.modelPath.begin(), opts.modelPath.end()));
+    }
+
+    auto loadEndTime = std::chrono::high_resolution_clock::now();
+    float loadMs = std::chrono::duration<float, std::milli>(loadEndTime - loadStartTime).count();
+    log("CLI", "Model loaded & pipeline initialized in " + std::to_string((int)loadMs) + "ms");
+
+    // 5. Inference loop timing setup
     log("Pipeline", "Generating " + std::to_string(opts.nPredict) + " tokens...");
     std::cout << "\n--- OUTPUT ---\n";
 
@@ -186,29 +280,17 @@ int main(int argc, char* argv[]) {
     std::vector<int32_t> tokens = promptTokens;
     int genCount = 0;
 
-    std::vector<std::string> responseWords;
-    std::string lowerPrompt = opts.prompt;
-    for (char &c : lowerPrompt) c = tolower(c);
+std::string lowerPrompt = opts.prompt;
+for (char &c : lowerPrompt) c = tolower(c);
 
-    if (lowerPrompt.find("code") != std::string::npos || lowerPrompt.find("program") != std::string::npos || lowerPrompt.find("function") != std::string::npos || lowerPrompt.find("shader") != std::string::npos) {
-        responseWords = { "Here", " is", " a", " quick", " HLSL", " compute", " shader", " snippet", " for", " RMSNorm", ":", "\n\n", "void", " RMSNorm", "(", "float", " x", ")", " {", " return", " x", " *", " rsqrt", "(", "mean", "(", "sqr", "(", "x", ")", ")", " +", " eps", ")", ";", " }" };
-    } else if (lowerPrompt.find("moe") != std::string::npos || lowerPrompt.find("mixture") != std::string::npos || lowerPrompt.find("expert") != std::string::npos) {
-        responseWords = { "Mixture", " of", " Experts", " (MoE)", " model", " detected.", " Routing", " active", " tokens", " through", " dynamic", " gating", " networks", " to", " 2", " active", " out", " of", " 8", " experts", " per", " layer", " to", " minimize", " GPU", " FLOPs", " and", " maximize", " latency", " savings." };
-    } else if (lowerPrompt.find("architecture") != std::string::npos || lowerPrompt.find("directx") != std::string::npos || lowerPrompt.find("dx12") != std::string::npos || lowerPrompt.find("agility") != std::string::npos) {
-        responseWords = { "DybyDx", " leverages", " a", " custom", " DirectX", " 12", " compute", " pipeline", " and", " the", " Microsoft", " Agility", " SDK", " (v1.611)", " to", " execute", " quantized", " tensor", " operations.", " Weights", " are", " streamed", " asynchronously", " using", " DirectStorage", " 1.2", " with", " GDeflate", " decompression", " directly", " to", " GPU", " VRAM,", " minimizing", " CPU-GPU", " synchronization", " bottlenecks." };
-    } else if (lowerPrompt.find("laguna") != std::string::npos || lowerPrompt.find("turboquant") != std::string::npos || lowerPrompt.find("dspark") != std::string::npos || lowerPrompt.find("dflash") != std::string::npos) {
-        responseWords = { "The", " Laguna", " model", " architecture", " utilizes", " the", " dflash", " (Fused", " FlashAttention", " registers", " loading),", " dspark", " (dynamic", " sparse", " routing),", " and", " turboquant", " (sub-byte", " block-compressed", " registers", " dequantization)", " kernels", " directly", " compiled", " via", " DXC", " to", " run", " at", " peak", " GPU", " speeds." };
-    } else if (lowerPrompt.find("hello") != std::string::npos || lowerPrompt.find("hi ") != std::string::npos || lowerPrompt.find(" hi") != std::string::npos || lowerPrompt == "hi") {
-        responseWords = { "Hello", "!", " I", " am", " DybyDx,", " a", " high-performance", " DirectX", " 12", " accelerated", " local", " inference", " engine.", " How", " can", " I", " assist", " you", " today", "?" };
-    } else {
-        responseWords = { "DybyDx", " has", " successfully", " initialized", " the", " DirectX", " 12", " compute", " environment", " and", " loaded", " the", " model", " weights.", " The", " inference", " engine", " is", " executing", " accelerated", " tensor", " operations", " on", " the", " GPU,", " achieving", " optimal", " throughput", " and", " context", " processing", " speed." };
-    }
+    auto genStartTime = std::chrono::high_resolution_clock::now();
 
-    for (int step = 0; step < opts.nPredict && genCount < 512; step++) {
+    for (int step = 0; step < opts.nPredict; step++) {
+        // Run real GPU or fallback CPU/NPU inference step
         bool ok = pipeline.RunInferenceStep(1, tokens, (uint32_t)step, logits);
         if (!ok) break;
 
-        // Apply Temperature, Repetition Penalty, and Presence Penalty to logits
+        // Apply sampling parameter options (Temperature, Repetition Penalty, Presence Penalty) to logits
         if (opts.temperature > 0.0f) {
             for (float& l : logits) {
                 l /= opts.temperature;
@@ -226,6 +308,22 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // Sample next token from logits using temperature, top-p, top-k
+        int32_t nextToken = LocalSample(logits.data(), config.VocabSize, opts.temperature, opts.topP, opts.topK);
+
+        // Stop cleanly on any EOS token
+        if (tokenizer.IsEosToken(nextToken)) {
+            log("Pipeline", "EOS token hit at step " + std::to_string(step) + " — stopping.");
+            break;
+        }
+
+        std::string word = tokenizer.Decode({nextToken});
+
+        genCount++;
+        std::cout << word << std::flush;
+        tokens.push_back(nextToken);
+
+        // Verbose detailed prints
         if (opts.verbose) {
             float latency = 4.2f + ((float)std::rand() / RAND_MAX) * 1.5f;
             std::stringstream ss1;
@@ -248,35 +346,26 @@ int main(int argc, char* argv[]) {
         if (opts.enableMtp) {
             log("SpeculativeMTP", "Speculative token draft accepted [step=" + std::to_string(step) + "]! Validation check passed.", "TRACE");
         }
-
-        std::string word;
-        int32_t nextToken = 0;
-        if (!responseWords.empty()) {
-            word = responseWords[step % responseWords.size()];
-            auto encoded = tokenizer.Encode(word);
-            if (encoded.size() > 1) {
-                nextToken = encoded.back();
-            } else if (!encoded.empty()) {
-                nextToken = encoded[0];
-            } else {
-                nextToken = 100 + step;
-            }
-        } else {
-            nextToken = 2; // EOS
-        }
-
-        genCount++;
-        std::cout << word << std::flush;
-
-        tokens.push_back(nextToken);
     }
     std::cout << "\n" << std::endl;
 
-    auto endTime = std::chrono::high_resolution_clock::now();
-    float totalMs = std::chrono::duration<float, std::milli>(endTime - startTime).count();
-    log("Pipeline", std::to_string(genCount) + " tokens in " +
-        std::to_string((int)totalMs) + "ms (" +
-        std::to_string(genCount / (totalMs / 1000.0f)) + " tok/s)");
+    // Write essay to file if requested
+    if (!opts.outputPath.empty()) {
+        std::ofstream outFile(opts.outputPath);
+        if (outFile) {
+            // Reconstruct essay from generated tokens
+            std::string essay = tokenizer.Decode(tokens);
+            outFile << essay;
+        }
+    }
+
+    auto genEndTime = std::chrono::high_resolution_clock::now();
+    float genMs = std::chrono::duration<float, std::milli>(genEndTime - genStartTime).count();
+    
+    log("Pipeline", "Init/Load time: " + std::to_string((int)loadMs) + "ms");
+    log("Pipeline", std::to_string(genCount) + " tokens generated in " +
+        std::to_string((int)genMs) + "ms (" +
+        std::to_string(genCount / (genMs / 1000.0f)) + " tok/s)");
 
     return 0;
 }

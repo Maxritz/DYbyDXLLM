@@ -1,0 +1,182 @@
+============================= 
+Benchmark run started at Thu 07/16/2026  2:08:41.29 
+============================= 
+----- Running MiniCPM‑V‑4_6‑Q8_0 ----- 
+[02:08:41.432][INFO] [CLI] DybyDx v1.0.0 starting
+[02:08:41.432][INFO] [DX12] Initializing...
+[DirectXEngine] Initializing DirectX 12 via Agility SDK...
+[DirectXEngine] GPU: Intel(R) Graphics | VRAM: 128 MB | SM6.6: YES | ReBAR: YES (GPU_UPLOAD active)
+[DirectXEngine] D3D12 device + queues ready.
+[02:08:41.524][INFO] [DX12] Intel(R) Graphics | VRAM: 128 MB | ReBAR: YES
+[02:08:41.524][INFO] [Model] Loading C:\Users\rina0423\Desktop\DX\MiniCPM-V-4_6-Q8_0.gguf...
+[GgufLoader] Full load: 320 tensors, 773 MB
+[02:08:43.098][INFO] [Model] GGUF v3 | 320 tensors
+[02:08:43.098][INFO] [Model] Arch: qwen35
+[Tokenizer] Loaded 248097 tokens from GGUF metadata. BOS=248045 EOS=248046
+[02:08:43.220][INFO] [Tokenizer] Chat template arch: qwen35
+[02:08:43.221][INFO] [Tokenizer] 59 tokens from prompt
+[ModelPipeline][CPU] ISA: AVX2 AVX | 18 logical cores
+[DirectStorage] Runtime not available (hr=80004002). Falling back to manual CopyResource uploads.
+[OpenVINO] Available devices: CPU GPU NPU
+[OpenVINO] Selected device: NPU
+[KVCache] Allocated K+V buffers. quant=fp16 size_per_buf=10 MB maxSeq=800
+[Optimizations] Registered pipelines:
+  - dflash (Fused Attention registers loading CS)
+  - dspark (Dynamic sparse expert routers CS)
+  - turboquant (Register-level bit-shifting block decompressions CS)
+  - Active optimization profile: Standard DirectX 12 Compute.
+[ShaderCompiler] Compiling shaders/TurboKernels.hlsl [FusedFlashAttentionKernel]...
+[ShaderCompiler] DXC SM6 OK (6076 bytes).
+[ShaderCompiler] Compiling shaders/TurboKernels.hlsl [SparseMoERoutingKernel]...
+[ShaderCompiler] DXC SM6 OK (6732 bytes).
+[ShaderCompiler] Compiling shaders/TurboKernels.hlsl [TurboQuantDequantKernel]...
+[ShaderCompiler] DXC SM6 OK (4772 bytes).
+[ModelPipeline] Initialized pipeline.
+[ModelPipeline] Loading: C:\Users\rina0423\Desktop\DX\MiniCPM-V-4_6-Q8_0.gguf
+[GgufLoader] Full load: 140 tensors, 305 MB
+[ModelPipeline] GGUF: version=3 tensors=140
+[ModelPipeline] Arch: qwen35
+[KVCache] Allocated K+V buffers. quant=fp16 size_per_buf=4 MB maxSeq=800
+[ModelPipeline] Loaded 140 tensors. VRAM: 1fa MB, RAM: 101 MB.
+[ShaderCompiler] Compiling shaders/QuantizedGEMM.hlsl [main]...
+[ShaderCompiler] DXC SM6 OK (5444 bytes).
+[ModelPipeline][PSO] GEMM pipeline compiled and cached.
+[02:08:44.962][INFO] [CLI] Model loaded & pipeline initialized in 3529ms
+[02:08:44.962][INFO] [Pipeline] Generating 200 tokens...
+
+--- OUTPUT ---
+reteded_d_BUJXOYWJ3,[40PNKC_C_d.p . in de def pr pr te T n.  e i I V / / |ĊĊ;/ +Ċ ( D B -  âĢ/( /[338+(DNLC ( (  in-2"ĊĊ;..; and but f h t  - S D P G K L " n S C R E p P K L F a a v oOStADRYDKWEJWc C ddmwlalunorab_b.t_f.f_t.p.F F M N ( l o ffkeeony y ' r " un t H (:1Ċ - <, c A H [ C R M F.)_-5MYhtrcookpfxkpstchleuliridit
+
+[02:08:45.471][INFO] [Pipeline] Init/Load time: 3529ms
+[02:08:45.471][INFO] [Pipeline] 200 tokens generated in 508ms (393.497284 tok/s)
+ 
+----- Running Gemma‑4‑E4B‑it‑Q4_K_M ----- 
+[02:08:45.797][INFO] [CLI] DybyDx v1.0.0 starting
+[02:08:45.797][INFO] [DX12] Initializing...
+[DirectXEngine] Initializing DirectX 12 via Agility SDK...
+[DirectXEngine] GPU: Intel(R) Graphics | VRAM: 128 MB | SM6.6: YES | ReBAR: YES (GPU_UPLOAD active)
+[DirectXEngine] D3D12 device + queues ready.
+[02:08:45.889][INFO] [DX12] Intel(R) Graphics | VRAM: 128 MB | ReBAR: YES
+[02:08:45.889][INFO] [Model] Loading C:\Users\rina0423\Desktop\DX\gemma-4-E4B-it-Q4_K_M.gguf...
+[GgufLoader] Full load: 720 tensors, 4746 MB
+[02:08:58.372][INFO] [Model] GGUF v3 | 720 tensors
+[02:08:58.372][INFO] [Model] Arch: gemma4
+[Tokenizer] Loaded 262144 tokens from GGUF metadata. BOS=2 EOS=106
+[02:08:58.764][INFO] [Tokenizer] Chat template arch: gemma4
+[02:08:58.766][INFO] [Tokenizer] 50 tokens from prompt
+[ModelPipeline][CPU] ISA: AVX2 AVX | 18 logical cores
+[DirectStorage] Runtime not available (hr=80004002). Falling back to manual CopyResource uploads.
+[OpenVINO] Available devices: CPU GPU NPU
+[OpenVINO] Selected device: NPU
+[KVCache] Allocated K+V buffers. quant=fp16 size_per_buf=10 MB maxSeq=800
+[Optimizations] Registered pipelines:
+  - dflash (Fused Attention registers loading CS)
+  - dspark (Dynamic sparse expert routers CS)
+  - turboquant (Register-level bit-shifting block decompressions CS)
+  - Active optimization profile: Standard DirectX 12 Compute.
+[ShaderCompiler] Compiling shaders/TurboKernels.hlsl [FusedFlashAttentionKernel]...
+[ShaderCompiler] DXC SM6 OK (6076 bytes).
+[ShaderCompiler] Compiling shaders/TurboKernels.hlsl [SparseMoERoutingKernel]...
+[ShaderCompiler] DXC SM6 OK (6732 bytes).
+[ShaderCompiler] Compiling shaders/TurboKernels.hlsl [TurboQuantDequantKernel]...
+[ShaderCompiler] DXC SM6 OK (4772 bytes).
+[ModelPipeline] Initialized pipeline.
+[ModelPipeline] Loading: C:\Users\rina0423\Desktop\DX\gemma-4-E4B-it-Q4_K_M.gguf
+[GgufLoader] Full load: 2d0 tensors, 128a MB
+[ModelPipeline] GGUF: version=3 tensors=2d0
+[ModelPipeline] Arch: gemma4
+[KVCache] Allocated K+V buffers. quant=fp16 size_per_buf=a MB maxSeq=800
+[ModelPipeline][SplitLoad] VRAM full (7fe MB / 2048 MB) — blk.35.attn_output.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7fe MB / 2048 MB) — blk.35.attn_q.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7fe MB / 2048 MB) — blk.35.ffn_down.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7fe MB / 2048 MB) — blk.35.ffn_gate.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7fe MB / 2048 MB) — blk.35.ffn_up.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7fe MB / 2048 MB) — blk.36.attn_output.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7fe MB / 2048 MB) — blk.36.attn_q.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.36.ffn_down.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.36.ffn_gate.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.36.ffn_up.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.39.attn_v.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.36.inp_gate.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.39.attn_q.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.37.attn_k.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.37.attn_output.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.37.attn_v.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.37.ffn_down.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.37.ffn_gate.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.37.inp_gate.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.41.ffn_up.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.38.attn_q.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.38.attn_v.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.38.ffn_up.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.38.proj.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.39.attn_k.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.39.attn_output.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.39.ffn_down.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.39.ffn_up.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.39.proj.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.40.attn_k.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.40.attn_q.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.40.attn_v.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.40.inp_gate.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.40.proj.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.41.attn_q.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.41.attn_v.weight → CPU RAM
+[ModelPipeline][SplitLoad] VRAM full (7ff MB / 2048 MB) — blk.41.ffn_gate.weight → CPU RAM
+[ModelPipeline] Loaded 2d0 tensors. VRAM: 7ff MB, RAM: 8bc MB.
+[ShaderCompiler] Compiling shaders/QuantizedGEMM.hlsl [main]...
+[ShaderCompiler] DXC SM6 OK (5444 bytes).
+[ModelPipeline][PSO] GEMM pipeline compiled and cached.
+[02:09:41.498][INFO] [CLI] Model loaded & pipeline initialized in 55698ms
+[02:09:41.499][INFO] [Pipeline] Generating 200 tokens...
+
+--- OUTPUT ---
+[multimodal][multimodal][multimodal][multimodal]
+
+[02:09:41.548][INFO] [Pipeline] Init/Load time: 55698ms
+[02:09:41.548][INFO] [Pipeline] 200 tokens generated in 49ms (4077.288818 tok/s)
+ 
+----- Running Phi‑3‑mini‑4k‑instruct‑q4 ----- 
+[02:09:45.223][INFO] [CLI] DybyDx v1.0.0 starting
+[02:09:45.223][INFO] [DX12] Initializing...
+[DirectXEngine] Initializing DirectX 12 via Agility SDK...
+[DirectXEngine] GPU: Intel(R) Graphics | VRAM: 128 MB | SM6.6: YES | ReBAR: YES (GPU_UPLOAD active)
+[DirectXEngine] D3D12 device + queues ready.
+[02:09:45.446][INFO] [DX12] Intel(R) Graphics | VRAM: 128 MB | ReBAR: YES
+[02:09:45.446][INFO] [Model] Loading C:\Users\rina0423\Desktop\DX\Phi-3-mini-4k-instruct-q4.gguf...
+[GgufLoader] Full load: 195 tensors, 2282 MB
+[02:09:53.943][INFO] [Model] GGUF v3 | 195 tensors
+[02:09:53.943][INFO] [Model] Arch: phi3
+[Tokenizer] Loaded 32065 tokens from GGUF metadata. BOS=1 EOS=32000
+[02:09:53.967][INFO] [Tokenizer] Chat template arch: phi3
+[02:09:53.967][INFO] [Tokenizer] 40 tokens from prompt
+[ModelPipeline][CPU] ISA: AVX2 AVX | 18 logical cores
+[DirectStorage] Runtime not available (hr=80004002). Falling back to manual CopyResource uploads.
+[OpenVINO] Available devices: CPU GPU NPU
+[OpenVINO] Selected device: NPU
+[KVCache] Allocated K+V buffers. quant=fp16 size_per_buf=10 MB maxSeq=800
+[Optimizations] Registered pipelines:
+  - dflash (Fused Attention registers loading CS)
+  - dspark (Dynamic sparse expert routers CS)
+  - turboquant (Register-level bit-shifting block decompressions CS)
+  - Active optimization profile: Standard DirectX 12 Compute.
+[ShaderCompiler] Compiling shaders/TurboKernels.hlsl [FusedFlashAttentionKernel]...
+[ShaderCompiler] DXC SM6 OK (6076 bytes).
+[ShaderCompiler] Compiling shaders/TurboKernels.hlsl [SparseMoERoutingKernel]...
+[ShaderCompiler] DXC SM6 OK (6732 bytes).
+[ShaderCompiler] Compiling shaders/TurboKernels.hlsl [TurboQuantDequantKernel]...
+[ShaderCompiler] DXC SM6 OK (4772 bytes).
+[ModelPipeline] Initialized pipeline.
+[ModelPipeline] Loading: C:\Users\rina0423\Desktop\DX\Phi-3-mini-4k-instruct-q4.gguf
+[GgufLoader] Full load: c3 tensors, 8ea MB
+[ModelPipeline] GGUF: version=3 tensors=c3
+[ModelPipeline] Arch: phi3
+[KVCache] Allocated K+V buffers. quant=fp16 size_per_buf=c MB maxSeq=800
+[ModelPipeline] Loaded c3 tensors. VRAM: 7d3 MB, RAM: 2e MB.
+[ShaderCompiler] Compiling shaders/QuantizedGEMM.hlsl [main]...
+[ShaderCompiler] DXC SM6 OK (5444 bytes).
+[ModelPipeline][PSO] GEMM pipeline compiled and cached.
+[02:10:02.749][INFO] [CLI] Model loaded & pipeline initialized in 17525ms
+[02:10:02.749][INFO] [Pipeline] Generating 64 tokens...
+
+--- OUTPUT ---

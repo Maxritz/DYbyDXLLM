@@ -5,4 +5,4 @@ cd build
 cmake .. -G "Visual Studio 17 2022" -A x64
 cmake --build . --config Release
 echo Done! Check bin/Release/ for DybyDx.dll
-pause
+rem pause

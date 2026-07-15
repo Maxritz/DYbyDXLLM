@@ -6,7 +6,6 @@
 #include <vector>
 #include <memory>
 #include <string>
-#include "dybydx/core/DirectXEngine.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -32,7 +31,7 @@ namespace DirectLLM {
         AdvancedVendorOptimizations();
         ~AdvancedVendorOptimizations();
 
-        bool Initialize(DirectXEngine* dxEngine, const OffloadConfig& offloadConfig);
+        bool Initialize(ID3D12Device* device, const OffloadConfig& offloadConfig);
         
         // Fused Attention (FlashAttention-style) dynamic setup
         bool DispatchFusedAttention(ID3D12GraphicsCommandList* cmdList,
@@ -69,12 +68,12 @@ namespace DirectLLM {
         void LogOptimizationSpecs();
 
     private:
-        DirectXEngine* m_dxEngine = nullptr;
         ID3D12Device* m_device = nullptr;
         OffloadConfig m_config;
         OptimizationPipelineType m_activePipeline = OptimizationPipelineType::StandardD3D12Compute;
 
         // Custom handles for CUDA or HIP background worker loops (for future vendor extensions)
+        // Primary target currently is DirectX 12 + Intel OpenVINO.
         void* m_cudaContextHandle = nullptr;
         void* m_amdHipDeviceContext = nullptr;
 
