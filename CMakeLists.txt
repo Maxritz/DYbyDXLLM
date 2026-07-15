@@ -19,18 +19,37 @@ set(SOURCES
 )
 
 set(DIRECTSTORAGE_DIR "C:/Users/rina0423/Desktop/DX/directstorage")
+set(DXC_DIR "C:/Users/rina0423/Desktop/DX/DXcompiler")
+set(OPENVINO_DIR "C:/Users/rina0423/Desktop/DX/openvino/runtime")
+
+# OpenVINO SDK paths
+set(OPENVINO_INCLUDE_DIR "${OPENVINO_DIR}/include")
+set(OPENVINO_LIB_DIR "${OPENVINO_DIR}/lib/intel64/Release")
 
 # Native DLL for C# CLI P/Invoke
 add_library(DirectLLM.Core SHARED ${SOURCES})
-target_include_directories(DirectLLM.Core PRIVATE include ${DIRECTSTORAGE_DIR}/native/include)
-target_link_directories(DirectLLM.Core PRIVATE ${DIRECTSTORAGE_DIR}/native/lib/x64)
-target_link_libraries(DirectLLM.Core PRIVATE d3d12 dxgi d3dcompiler dstorage)
+target_include_directories(DirectLLM.Core PRIVATE
+    include
+    ${DIRECTSTORAGE_DIR}/native/include
+    ${DXC_DIR}/inc
+)
+target_link_directories(DirectLLM.Core PRIVATE
+    ${DIRECTSTORAGE_DIR}/native/lib/x64
+    ${DXC_DIR}/lib/x64
+)
+target_link_libraries(DirectLLM.Core PRIVATE d3d12 dxgi d3dcompiler dstorage dxcompiler)
 
-# C++ CLI executable
 add_executable(DybyDx cli/main.cpp ${SOURCES})
-target_include_directories(DybyDx PRIVATE include ${DIRECTSTORAGE_DIR}/native/include)
-target_link_directories(DybyDx PRIVATE ${DIRECTSTORAGE_DIR}/native/lib/x64)
-target_link_libraries(DybyDx PRIVATE d3d12 dxgi d3dcompiler dstorage)
+target_include_directories(DybyDx PRIVATE
+    include
+    ${DIRECTSTORAGE_DIR}/native/include
+    ${DXC_DIR}/inc
+)
+target_link_directories(DybyDx PRIVATE
+    ${DIRECTSTORAGE_DIR}/native/lib/x64
+    ${DXC_DIR}/lib/x64
+)
+target_link_libraries(DybyDx PRIVATE d3d12 dxgi d3dcompiler dstorage dxcompiler)
 
 # Post-build: copy shaders and DirectStorage DLLs
 foreach(TGT DirectLLM.Core DybyDx)
@@ -48,6 +67,12 @@ foreach(TGT DirectLLM.Core DybyDx)
             "${DIRECTSTORAGE_DIR}/native/bin/x64/dstoragecore.dll"
             "$<TARGET_FILE_DIR:${TGT}>/dstoragecore.dll"
         COMMENT "Copying DirectStorage runtime DLLs to ${TGT}..."
+    )
+    add_custom_command(TARGET ${TGT} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${DXC_DIR}/bin/x64/dxcompiler.dll"
+            "$<TARGET_FILE_DIR:${TGT}>/dxcompiler.dll"
+        COMMENT "Copying DXC compiler DLL to ${TGT}..."
     )
 endforeach()
 

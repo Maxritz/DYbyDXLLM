@@ -1,8 +1,10 @@
 // DirectLLM C++ Core - (C) 2026 DirectLLM Team
 #include "dybydx/core/DirectXEngine.h"
 #include <d3dcompiler.h>
+#include <dxcapi.h>
 #include <iostream>
 #include <sstream>
+#include <fstream>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -144,50 +146,108 @@ namespace DirectLLM {
     }
 
     bool DirectXEngine::CompileComputeShader(const std::wstring& shaderPath, const std::string& entryPoint, ID3DBlob** outShaderBlob) {
-        LogTrace("ShaderCompiler", "Compiling shader " + std::string(shaderPath.begin(), shaderPath.end()) + " [" + entryPoint + "]...");
+        LogTrace("ShaderCompiler", "Compiling " + std::string(shaderPath.begin(), shaderPath.end()) + " [" + entryPoint + "]...");
 
+        // Try DXC compiler first (supports SM 6.0+)
+        HRESULT hr;
+        ComPtr<IDxcUtils> utils;
+        ComPtr<IDxcCompiler3> compiler;
+        hr = DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&utils));
+        if (SUCCEEDED(hr)) hr = DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler));
+
+        if (SUCCEEDED(hr) && compiler) {
+            // Load shader source
+            std::ifstream file(shaderPath);
+            if (!file.is_open()) {
+                LogTrace("ShaderCompiler", "Cannot open shader file.");
+                return false;
+            }
+            std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+
+            ComPtr<IDxcBlobEncoding> sourceBlob;
+            utils->CreateBlob(source.c_str(), (UINT32)source.size(), CP_UTF8, &sourceBlob);
+
+            DxcBuffer buffer = {};
+            buffer.Ptr = sourceBlob->GetBufferPointer();
+            buffer.Size = sourceBlob->GetBufferSize();
+            buffer.Encoding = 0;
+
+            std::vector<LPCWSTR> args = {
+                L"-E", std::wstring(entryPoint.begin(), entryPoint.end()).c_str(),
+                L"-T", L"cs_6_0",
+                L"-Zi", L"-Od"
+            };
+
+            ComPtr<IDxcResult> results;
+            hr = compiler->Compile(&buffer, args.data(), (UINT32)args.size(), nullptr, IID_PPV_ARGS(&results));
+            if (SUCCEEDED(hr)) {
+                ComPtr<IDxcBlobUtf8> errors;
+                results->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
+                if (errors && errors->GetStringLength() > 0) {
+                    LogTrace("ShaderCompiler", "DXC warnings: " + std::string(errors->GetStringPointer()));
+                }
+
+                HRESULT status;
+                results->GetStatus(&status);
+                if (SUCCEEDED(status)) {
+                    ComPtr<IDxcBlob> shaderBlob;
+                    results->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&shaderBlob), nullptr);
+                    if (shaderBlob) {
+                        // Convert DXC Blob to ID3DBlob
+                        D3DCreateBlob(shaderBlob->GetBufferSize(), outShaderBlob);
+                        if (*outShaderBlob) {
+                            memcpy((*outShaderBlob)->GetBufferPointer(), shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize());
+                        }
+                        LogTrace("ShaderCompiler", "DXC SM 6.0 compiled OK (" + std::to_string(shaderBlob->GetBufferSize()) + " bytes).");
+                        return *outShaderBlob != nullptr;
+                    }
+                } else {
+                    // DXC failed — provide error message
+                    ComPtr<IDxcBlobUtf8> errorBlob;
+                    results->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errorBlob), nullptr);
+                    if (errorBlob && errorBlob->GetStringLength() > 0)
+                        LogTrace("ShaderCompiler", "DXC FAILED: " + std::string(errorBlob->GetStringPointer()));
+                    else
+                        LogTrace("ShaderCompiler", "DXC FAILED: unknown error.");
+                }
+            }
+        }
+
+        // Fallback to d3dcompiler with cs_5_1
+        LogTrace("ShaderCompiler", "Falling back to d3dcompiler cs_5_1...");
         ComPtr<ID3DBlob> errorBlob;
-        UINT compileFlags = D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES | D3DCOMPILE_OPTIMIZATION_LEVEL3;
-
-        // Try cs_5_1 as the robust compiler-agnostic shader model standard when using d3dcompiler
-        HRESULT hr = D3DCompileFromFile(
-            shaderPath.c_str(),
-            nullptr,
-            D3D_COMPILE_STANDARD_FILE_INCLUDE,
-            entryPoint.c_str(),
-            "cs_5_1",
-            compileFlags,
-            0,
-            outShaderBlob,
-            &errorBlob
-        );
+        UINT flags = D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES | D3DCOMPILE_OPTIMIZATION_LEVEL3;
+        hr = D3DCompileFromFile(shaderPath.c_str(), nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+            entryPoint.c_str(), "cs_5_1", flags, 0, outShaderBlob, &errorBlob);
 
         if (FAILED(hr)) {
-            // Fall back to cs_5_0 for maximum driver/legacy compatibility
-            hr = D3DCompileFromFile(
-                shaderPath.c_str(),
-                nullptr,
-                D3D_COMPILE_STANDARD_FILE_INCLUDE,
-                entryPoint.c_str(),
-                "cs_5_0",
-                compileFlags,
-                0,
-                outShaderBlob,
-                &errorBlob
-            );
+            hr = D3DCompileFromFile(shaderPath.c_str(), nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+                entryPoint.c_str(), "cs_5_0", flags, 0, outShaderBlob, &errorBlob);
         }
 
         if (FAILED(hr)) {
-            if (errorBlob) {
-                std::string errorMsg = (char*)errorBlob->GetBufferPointer();
-                LogTrace("ShaderCompiler", "COMPILATION FAILED: " + errorMsg);
-            } else {
-                LogTrace("ShaderCompiler", "COMPILATION FAILED: Unknown file error.");
-            }
+            if (errorBlob) LogTrace("ShaderCompiler", "FALLBACK FAILED: " + std::string((char*)errorBlob->GetBufferPointer()));
+            else LogTrace("ShaderCompiler", "FALLBACK FAILED: unknown.");
             return false;
         }
+        LogTrace("ShaderCompiler", "d3dcompiler fallback OK.");
+        return true;
+    }
 
-        LogTrace("ShaderCompiler", "Shader compiled successfully.");
+    bool DirectXEngine::CreateComputePipelineState(ID3DBlob* shaderBlob, ID3D12RootSignature* rootSignature, ID3D12PipelineState** outPSO) {
+        if (!shaderBlob || !rootSignature || !m_device) return false;
+
+        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+        psoDesc.pRootSignature = rootSignature;
+        psoDesc.CS.pShaderBytecode = shaderBlob->GetBufferPointer();
+        psoDesc.CS.BytecodeLength = shaderBlob->GetBufferSize();
+        psoDesc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+
+        HRESULT hr = m_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(outPSO));
+        if (FAILED(hr)) {
+            LogTrace("DirectXEngine", "CreateComputePipelineState FAILED.");
+            return false;
+        }
         return true;
     }
 

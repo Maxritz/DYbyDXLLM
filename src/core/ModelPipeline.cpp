@@ -1,5 +1,6 @@
 #include "dybydx/core/ModelPipeline.h"
 #include "dybydx/core/GgufLoader.h"
+#include "dybydx/core/DirectStorageLoader.h"
 #include <iostream>
 #include <cmath>
 #include <sstream>
