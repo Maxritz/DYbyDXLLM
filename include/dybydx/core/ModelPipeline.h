@@ -30,13 +30,18 @@ namespace DirectLLM {
     enum class QuantizationType {
         None_FP32,        // Full Single Precision (32-bit)
         None_FP16,        // Pure Half Precision (16-bit)
-        Q8_0,             // 8-bit block-quantized weights
-        Q6_K,             // 6-bit block-quantized weights
-        Q5_K,             // 5-bit block-quantized weights
-        Q4_K,             // 4-bit block-quantized weights
-        Q3_K,             // 3-bit block-quantized weights
+        Q1_K,             // 1-bit ultra-sparse weights
         Q2_K,             // 2-bit block-quantized weights
-        Q1_K              // 1-bit ultra-sparse weights
+        Q3_K,             // 3-bit block-quantized weights
+        Q4_0,             // 4-bit block-quantized weights (legacy)
+        Q4_1,             // 4-bit block-quantized weights with linear offset
+        Q4_K,             // 4-bit block-quantized weights (modern)
+        Q5_0,             // 5-bit block-quantized weights
+        Q5_1,             // 5-bit block-quantized weights with linear offset
+        Q5_K,             // 5-bit block-quantized weights (modern)
+        Q6_K,             // 6-bit block-quantized weights
+        Q8_0,             // 8-bit block-quantized weights (legacy)
+        Q8_K              // 8-bit block-quantized weights (modern)
     };
 
     enum class DeviceLocation {

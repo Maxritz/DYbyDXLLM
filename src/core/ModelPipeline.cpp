@@ -16,8 +16,18 @@ namespace DirectLLM {
         switch (QuantType) {
             case QuantizationType::None_FP32: return elements * 4;
             case QuantizationType::None_FP16: return elements * 2;
-            case QuantizationType::Q8_0: return elements;
-            case QuantizationType::Q4_K: return elements / 2;
+            case QuantizationType::Q8_0:
+            case QuantizationType::Q8_K:      return elements;
+            case QuantizationType::Q6_K:      return (elements * 6) / 8;
+            case QuantizationType::Q5_0:
+            case QuantizationType::Q5_1:
+            case QuantizationType::Q5_K:      return (elements * 5) / 8;
+            case QuantizationType::Q4_0:
+            case QuantizationType::Q4_1:
+            case QuantizationType::Q4_K:      return elements / 2;
+            case QuantizationType::Q3_K:      return (elements * 3) / 8;
+            case QuantizationType::Q2_K:      return elements / 4;
+            case QuantizationType::Q1_K:      return elements / 8;
             default: return elements * 2;
         }
     }
@@ -83,7 +93,22 @@ namespace DirectLLM {
             Tensor t;
             t.Name = name;
             for (auto d : tensor.Shape) t.Shape.push_back((size_t)d);
-            t.QuantType = QuantizationType::None_FP32;
+            switch (tensor.Type) {
+                case GgmlType::F32:  t.QuantType = QuantizationType::None_FP32; break;
+                case GgmlType::F16:  t.QuantType = QuantizationType::None_FP16; break;
+                case GgmlType::Q4_0: t.QuantType = QuantizationType::Q4_0; break;
+                case GgmlType::Q4_1: t.QuantType = QuantizationType::Q4_1; break;
+                case GgmlType::Q4_K: t.QuantType = QuantizationType::Q4_K; break;
+                case GgmlType::Q5_0: t.QuantType = QuantizationType::Q5_0; break;
+                case GgmlType::Q5_1: t.QuantType = QuantizationType::Q5_1; break;
+                case GgmlType::Q5_K: t.QuantType = QuantizationType::Q5_K; break;
+                case GgmlType::Q6_K: t.QuantType = QuantizationType::Q6_K; break;
+                case GgmlType::Q8_0: t.QuantType = QuantizationType::Q8_0; break;
+                case GgmlType::Q8_K: t.QuantType = QuantizationType::Q8_K; break;
+                case GgmlType::Q2_K: t.QuantType = QuantizationType::Q2_K; break;
+                case GgmlType::Q3_K: t.QuantType = QuantizationType::Q3_K; break;
+                default:             t.QuantType = QuantizationType::None_FP16; break;
+            }
 
             size_t sizeInBytes = tensor.DataSize;
             
