@@ -7,6 +7,26 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# ---------------------------------------------------------------------------
+# Compiler optimisation + SIMD flags
+# ModelPipeline.cpp does runtime CPUID dispatch for AVX-512F / AVX2 / AVX.
+# Compiling with /arch:AVX512 (MSVC) or -march=native (GCC/Clang) makes all
+# intrinsic headers available; the runtime check ensures correctness on
+# machines that don't support every level.
+# ---------------------------------------------------------------------------
+if(MSVC)
+    add_compile_options(
+        /O2           # Full optimisation
+        /Oi           # Intrinsic functions
+        /Ot           # Favour speed over size
+        /fp:fast      # Fast floating-point (allows reassociation, reciprocals)
+        /arch:AVX512  # Enable AVX-512F/VL/BW/DQ intrinsic headers
+                      # Actual AVX-512 code is runtime-gated via CPUID + XCR0
+    )
+else()
+    add_compile_options(-O3 -march=native -ffast-math)
+endif()
+
 set(SOURCES
     src/core/DirectXEngine.cpp
     src/core/KVCacheManager.cpp

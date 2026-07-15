@@ -140,6 +140,13 @@ namespace DirectLLM {
         float GetGpuExecutionRatio() const;
 
     private:
+        // CPU SIMD capabilities — detected once at Initialize time
+        bool m_hasAVX512F    = false;
+        bool m_hasAVX2       = false;
+        bool m_hasAVX        = false;
+        int  m_cpuThreadCount = 1;
+        void DetectCPUCapabilities();
+
         DirectXEngine* m_dxEngine = nullptr;
         ModelConfig m_config;
         std::vector<TransformerLayer> m_layers;
@@ -195,6 +202,9 @@ namespace DirectLLM {
 
         bool BuildGEMMPipeline();
         bool EnsurePersistentBuffers(size_t hiddenBytes, size_t vocabBytes);
+
+        // SIMD-accelerated dot products (dispatched at runtime based on m_hasAVX*)
+        float DotProductSIMD(const float* a, const float* b, int n) const;
 
         void WaitForGPU();
     };
