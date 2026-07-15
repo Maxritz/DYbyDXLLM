@@ -123,7 +123,7 @@ namespace DirectLLM {
             size_t sizeInBytes = tensor.DataSize;
             
             DeviceLocation loc = DeviceLocation::GPU_VRAM;
-            if (!m_dxEngine || name.find("token_embd") != std::string::npos || name.find("output") != std::string::npos || name.find("lm_head") != std::string::npos) {
+            if (!m_dxEngine || name.find("token_embd") != std::string::npos) {
                 loc = DeviceLocation::CPU_SystemRAM;
             }
 
@@ -263,26 +263,105 @@ namespace DirectLLM {
         if (tokId < 0 || tokId >= vocab) tokId %= vocab;
         if (tokId < 0) tokId = 0;
 
-        // Use embedding + LM head if weight data loaded (fast path)
         int hidden = (int)m_config.HiddenDim;
         if (hidden <= 0) hidden = 2048;
-        float* embed = GetTensorData(m_weightTensors, "token_embd.weight");
-        float* lmHead = GetTensorData(m_weightTensors, "output.weight");
-        if (!lmHead) lmHead = GetTensorData(m_weightTensors, "lm_head.weight");
 
-        if (embed && lmHead && hidden > 0) {
+        auto embedIt = m_weightTensors.find("token_embd.weight");
+        if (embedIt == m_weightTensors.end()) embedIt = m_weightTensors.find("tok_embeddings.weight");
+        
+        auto lmHeadIt = m_weightTensors.find("output.weight");
+        if (lmHeadIt == m_weightTensors.end()) lmHeadIt = m_weightTensors.find("lm_head.weight");
+
+        if (embedIt != m_weightTensors.end() && lmHeadIt != m_weightTensors.end()) {
+            const Tensor& embedTensor = embedIt->second;
+            const Tensor& lmHeadTensor = lmHeadIt->second;
+
+            // Lookup embedding vector on CPU
             std::vector<float> x(hidden, 0.0f);
-            int stride = hidden;
-            for (int i = 0; i < hidden && tokId < vocab; i++)
-                x[i] = embed[tokId * stride + i];
-
-            for (int j = 0; j < vocab; j++) {
-                float sum = 0.0f;
-                for (int i = 0; i < hidden; i++)
-                    sum += x[i] * lmHead[j * hidden + i];
-                outLogits[j] = sum;
+            if (!embedTensor.CPUHostData.empty()) {
+                const float* embedData = reinterpret_cast<const float*>(embedTensor.CPUHostData.data());
+                std::memcpy(x.data(), embedData + tokId * hidden, hidden * sizeof(float));
             }
-            return true;
+
+            if (lmHeadTensor.Location == DeviceLocation::GPU_VRAM && m_dxEngine) {
+                // 1. Create a GPU buffer for x (input vector) and upload it
+                Tensor X;
+                X.Shape = { 1, (size_t)hidden };
+                X.QuantType = QuantizationType::None_FP32;
+                if (AllocateTensor(X, hidden * sizeof(float), DeviceLocation::GPU_VRAM)) {
+                    ComPtr<ID3D12Resource> uploadBuffer;
+                    if (m_dxEngine->AllocateGPUBuffer(hidden * sizeof(float), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, &uploadBuffer)) {
+                        void* pData = nullptr;
+                        uploadBuffer->Map(0, nullptr, &pData);
+                        std::memcpy(pData, x.data(), hidden * sizeof(float));
+                        uploadBuffer->Unmap(0, nullptr);
+
+                        ComPtr<ID3D12CommandAllocator> allocator;
+                        m_dxEngine->GetDevice()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&allocator));
+                        ComPtr<ID3D12GraphicsCommandList> list;
+                        m_dxEngine->GetDevice()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.Get(), nullptr, IID_PPV_ARGS(&list));
+
+                        list->CopyResource(X.GPUResource.Get(), uploadBuffer.Get());
+                        list->Close();
+
+                        ID3D12CommandList* lists[] = { list.Get() };
+                        m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, lists);
+                        
+                        ComPtr<ID3D12Fence> fence;
+                        m_dxEngine->GetDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+                        m_dxEngine->GetComputeQueue()->Signal(fence.Get(), 1);
+                        while (fence->GetCompletedValue() < 1) { Sleep(1); }
+                    }
+                }
+
+                // 2. Create a GPU buffer for Y (output logits)
+                Tensor Y;
+                Y.Shape = { 1, (size_t)vocab };
+                Y.QuantType = QuantizationType::None_FP32;
+                AllocateTensor(Y, vocab * sizeof(float), DeviceLocation::GPU_VRAM);
+
+                // 3. Dispatch GPU Matrix Multiply: X * W -> Y
+                DispatchGPUMatrixMultiply(X, lmHeadTensor, Y);
+
+                // 4. Copy Y logits back to CPU outLogits
+                ComPtr<ID3D12Resource> readbackBuffer;
+                if (m_dxEngine->AllocateGPUBuffer(vocab * sizeof(float), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, &readbackBuffer)) {
+                    ComPtr<ID3D12CommandAllocator> allocator;
+                    m_dxEngine->GetDevice()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&allocator));
+                    ComPtr<ID3D12GraphicsCommandList> list;
+                    m_dxEngine->GetDevice()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.Get(), nullptr, IID_PPV_ARGS(&list));
+
+                    list->CopyResource(readbackBuffer.Get(), Y.GPUResource.Get());
+                    list->Close();
+
+                    ID3D12CommandList* lists[] = { list.Get() };
+                    m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, lists);
+
+                    ComPtr<ID3D12Fence> fence;
+                    m_dxEngine->GetDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+                    m_dxEngine->GetComputeQueue()->Signal(fence.Get(), 1);
+                    while (fence->GetCompletedValue() < 1) { Sleep(1); }
+
+                    void* pData = nullptr;
+                    readbackBuffer->Map(0, nullptr, &pData);
+                    std::memcpy(outLogits.data(), pData, vocab * sizeof(float));
+                    readbackBuffer->Unmap(0, nullptr);
+                }
+                return true;
+            } else {
+                // CPU fallback loop
+                if (!lmHeadTensor.CPUHostData.empty()) {
+                    const float* lmHeadData = reinterpret_cast<const float*>(lmHeadTensor.CPUHostData.data());
+                    for (int j = 0; j < vocab; j++) {
+                        float sum = 0.0f;
+                        for (int i = 0; i < hidden; i++) {
+                            sum += x[i] * lmHeadData[j * hidden + i];
+                        }
+                        outLogits[j] = sum;
+                    }
+                    return true;
+                }
+            }
         }
 
         // Vocabulary-based fallback: select related tokens from the real GGUF vocabulary
