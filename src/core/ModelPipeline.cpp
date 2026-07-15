@@ -88,6 +88,16 @@ namespace DirectLLM {
         if (tokEmb && tokEmb->Shape.size() >= 2)
             m_config.VocabSize = (size_t)tokEmb->Shape[0];
 
+        // Prepare a single CommandAllocator and CommandList for batched GPU weight uploads
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        std::vector<ComPtr<ID3D12Resource>> stagingBuffers;
+        
+        if (m_dxEngine) {
+            m_dxEngine->GetDevice()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&allocator));
+            m_dxEngine->GetDevice()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.Get(), nullptr, IID_PPV_ARGS(&list));
+        }
+
         auto& tensors = loader.GetTensors();
         for (auto& [name, tensor] : tensors) {
             Tensor t;
@@ -138,7 +148,7 @@ namespace DirectLLM {
                     std::memcpy(t.CPUHostData.data(), tensor.DataPtr, sizeInBytes);
                 }
             } else {
-                if (tensor.DataPtr && sizeInBytes > 0) {
+                if (tensor.DataPtr && sizeInBytes > 0 && list) {
                     ComPtr<ID3D12Resource> uploadBuffer;
                     bool ok = m_dxEngine->AllocateGPUBuffer(sizeInBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, &uploadBuffer);
                     if (ok) {
@@ -147,27 +157,26 @@ namespace DirectLLM {
                         std::memcpy(pData, tensor.DataPtr, sizeInBytes);
                         uploadBuffer->Unmap(0, nullptr);
 
-                        ComPtr<ID3D12CommandAllocator> allocator;
-                        m_dxEngine->GetDevice()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&allocator));
-                        ComPtr<ID3D12GraphicsCommandList> list;
-                        m_dxEngine->GetDevice()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.Get(), nullptr, IID_PPV_ARGS(&list));
-
                         list->CopyResource(t.GPUResource.Get(), uploadBuffer.Get());
-                        list->Close();
-
-                        ID3D12CommandList* lists[] = { list.Get() };
-                        m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, lists);
-
-                        ComPtr<ID3D12Fence> fence;
-                        m_dxEngine->GetDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-                        m_dxEngine->GetComputeQueue()->Signal(fence.Get(), 1);
-                        while (fence->GetCompletedValue() < 1) {
-                            Sleep(1);
-                        }
+                        stagingBuffers.push_back(uploadBuffer);
                     }
                 }
             }
             m_weightTensors[name] = std::move(t);
+        }
+
+        // Close, submit the batched copy list and wait once
+        if (list) {
+            list->Close();
+            ID3D12CommandList* lists[] = { list.Get() };
+            m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, lists);
+
+            ComPtr<ID3D12Fence> fence;
+            m_dxEngine->GetDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+            m_dxEngine->GetComputeQueue()->Signal(fence.Get(), 1);
+            while (fence->GetCompletedValue() < 1) {
+                Sleep(1);
+            }
         }
 
         std::cout << "[ModelPipeline] Loaded " << m_weightTensors.size() << " tensors. VRAM: "
