@@ -173,6 +173,29 @@ namespace DirectLLM {
         ComPtr<ID3D12Fence> m_executionFence;
         UINT64 m_fenceValue = 0;
 
+        // Cached GEMM pipeline state — compiled once after LoadModelWeights, reused every token
+        ComPtr<ID3D12RootSignature> m_gemmRootSignature;
+        ComPtr<ID3D12PipelineState> m_gemmPSO;
+        bool m_gemmPSOReady = false;
+
+        // Persistent per-step GPU buffers (avoids per-token alloc/free)
+        ComPtr<ID3D12Resource> m_xUploadBuffer;   // UPLOAD heap: CPU->GPU for embedding vector X
+        ComPtr<ID3D12Resource> m_xGPUBuffer;      // DEFAULT heap: X on GPU
+        ComPtr<ID3D12Resource> m_yGPUBuffer;      // DEFAULT heap: Y (logits) on GPU
+        ComPtr<ID3D12Resource> m_yReadbackBuffer; // READBACK heap: GPU->CPU for logits
+        size_t m_persistentHiddenBytes = 0;
+        size_t m_persistentVocabBytes  = 0;
+
+        // Dedicated command allocator + list for inference (reset each step, not recreated)
+        ComPtr<ID3D12CommandAllocator> m_inferCmdAllocator;
+        ComPtr<ID3D12GraphicsCommandList> m_inferCmdList;
+        ComPtr<ID3D12Fence> m_inferFence;
+        UINT64 m_inferFenceValue = 0;
+        HANDLE m_inferFenceEvent = nullptr;
+
+        bool BuildGEMMPipeline();
+        bool EnsurePersistentBuffers(size_t hiddenBytes, size_t vocabBytes);
+
         void WaitForGPU();
     };
 }

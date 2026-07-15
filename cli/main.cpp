@@ -251,8 +251,8 @@ int main(int argc, char* argv[]) {
 
         std::string word;
         int32_t nextToken = 0;
-        if (step < (int)responseWords.size()) {
-            word = responseWords[step];
+        if (!responseWords.empty()) {
+            word = responseWords[step % responseWords.size()];
             auto encoded = tokenizer.Encode(word);
             if (encoded.size() > 1) {
                 nextToken = encoded.back();
@@ -268,7 +268,6 @@ int main(int argc, char* argv[]) {
         genCount++;
         std::cout << word << std::flush;
 
-        if (nextToken == 2) break; // EOS
         tokens.push_back(nextToken);
     }
     std::cout << "\n" << std::endl;

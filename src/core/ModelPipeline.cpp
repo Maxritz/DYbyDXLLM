@@ -34,7 +34,10 @@ namespace DirectLLM {
 
     ModelPipeline::ModelPipeline() {}
 
-    ModelPipeline::~ModelPipeline() { Reset(); }
+    ModelPipeline::~ModelPipeline() {
+        if (m_inferFenceEvent) CloseHandle(m_inferFenceEvent);
+        Reset();
+    }
 
     bool ModelPipeline::Initialize(DirectXEngine* dxEngine, const ModelConfig& config) {
         m_dxEngine = dxEngine;
@@ -54,6 +57,129 @@ namespace DirectLLM {
             tensor.CPUHostData.resize(sizeInBytes);
             m_systemRamUsageBytes += sizeInBytes;
         }
+        return true;
+    }
+
+    // -------------------------------------------------------------------
+    //  GPU helper: synchronous wait via Win32 event (no Sleep polling)
+    // -------------------------------------------------------------------
+    static void WaitFence(ID3D12Fence* fence, UINT64 value, HANDLE event) {
+        if (fence->GetCompletedValue() < value) {
+            fence->SetEventOnCompletion(value, event);
+            WaitForSingleObject(event, INFINITE);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    //  BuildGEMMPipeline — called ONCE after weights are loaded.
+    //  Compiles the HLSL shader and caches the PSO + root signature.
+    // -------------------------------------------------------------------
+    bool ModelPipeline::BuildGEMMPipeline() {
+        if (!m_dxEngine) return false;
+
+        // Compile shader
+        ComPtr<ID3DBlob> shaderBlob;
+        if (!m_dxEngine->CompileComputeShader(L"shaders/QuantizedGEMM.hlsl", "main", &shaderBlob)) {
+            std::cerr << "[ModelPipeline][PSO] Shader compile failed." << std::endl;
+            return false;
+        }
+
+        // Root signature (same layout as before)
+        D3D12_ROOT_PARAMETER rootParameters[6] = {};
+
+        rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rootParameters[0].Constants.ShaderRegister = 0;
+        rootParameters[0].Constants.RegisterSpace  = 0;
+        rootParameters[0].Constants.Num32BitValues = 3;
+        rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        for (int i = 1; i <= 4; i++) {
+            rootParameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rootParameters[i].Descriptor.ShaderRegister = (UINT)(i - 1);
+            rootParameters[i].Descriptor.RegisterSpace  = 0;
+            rootParameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        }
+
+        rootParameters[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        rootParameters[5].Descriptor.ShaderRegister = 0;
+        rootParameters[5].Descriptor.RegisterSpace  = 0;
+        rootParameters[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
+        rootSigDesc.NumParameters = 6;
+        rootSigDesc.pParameters   = rootParameters;
+        rootSigDesc.Flags         = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+        ComPtr<ID3DBlob> serializedSignature, errorBlob;
+        HRESULT hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                                  &serializedSignature, &errorBlob);
+        if (FAILED(hr)) {
+            std::cerr << "[ModelPipeline][PSO] Root sig serialization failed." << std::endl;
+            return false;
+        }
+
+        hr = m_dxEngine->GetDevice()->CreateRootSignature(0,
+            serializedSignature->GetBufferPointer(),
+            serializedSignature->GetBufferSize(),
+            IID_PPV_ARGS(&m_gemmRootSignature));
+        if (FAILED(hr)) return false;
+
+        ComPtr<ID3D12PipelineState> pso;
+        if (!m_dxEngine->CreateComputePipelineState(shaderBlob.Get(), m_gemmRootSignature.Get(), &pso))
+            return false;
+
+        m_gemmPSO = pso;
+
+        // Dedicated inference command allocator + list (created once, reset each step)
+        hr = m_dxEngine->GetDevice()->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&m_inferCmdAllocator));
+        if (FAILED(hr)) return false;
+
+        hr = m_dxEngine->GetDevice()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+            m_inferCmdAllocator.Get(), m_gemmPSO.Get(), IID_PPV_ARGS(&m_inferCmdList));
+        if (FAILED(hr)) return false;
+        m_inferCmdList->Close(); // start in closed state
+
+        hr = m_dxEngine->GetDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_inferFence));
+        if (FAILED(hr)) return false;
+
+        m_inferFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        m_inferFenceValue = 0;
+
+        m_gemmPSOReady = true;
+        std::cout << "[ModelPipeline][PSO] GEMM pipeline compiled and cached." << std::endl;
+        return true;
+    }
+
+    // -------------------------------------------------------------------
+    //  EnsurePersistentBuffers — lazily allocates (or reallocates) the
+    //  fixed-size GPU buffers used every inference step.
+    // -------------------------------------------------------------------
+    bool ModelPipeline::EnsurePersistentBuffers(size_t hiddenBytes, size_t vocabBytes) {
+        if (!m_dxEngine) return false;
+
+        bool needRebuild = (hiddenBytes != m_persistentHiddenBytes) ||
+                           (vocabBytes  != m_persistentVocabBytes);
+        if (!needRebuild) return true;
+
+        // X upload buffer (UPLOAD heap — mapped persistently)
+        if (!m_dxEngine->AllocateGPUBuffer(hiddenBytes, D3D12_HEAP_TYPE_UPLOAD,
+                D3D12_RESOURCE_STATE_GENERIC_READ, &m_xUploadBuffer)) return false;
+
+        // X GPU buffer (DEFAULT heap)
+        if (!m_dxEngine->AllocateGPUBuffer(hiddenBytes, D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_STATE_COMMON, &m_xGPUBuffer)) return false;
+
+        // Y GPU buffer (DEFAULT heap, UAV)
+        if (!m_dxEngine->AllocateGPUBuffer(vocabBytes, D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &m_yGPUBuffer)) return false;
+
+        // Y readback buffer (READBACK heap)
+        if (!m_dxEngine->AllocateGPUBuffer(vocabBytes, D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_STATE_COPY_DEST, &m_yReadbackBuffer)) return false;
+
+        m_persistentHiddenBytes = hiddenBytes;
+        m_persistentVocabBytes  = vocabBytes;
         return true;
     }
 
@@ -88,11 +214,16 @@ namespace DirectLLM {
         if (tokEmb && tokEmb->Shape.size() >= 2)
             m_config.VocabSize = (size_t)tokEmb->Shape[0];
 
-        // Prepare a single CommandAllocator and CommandList for batched GPU weight uploads
+        // ---- Batched GPU weight upload with 64 MB staging flush limit ----
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> list;
         std::vector<ComPtr<ID3D12Resource>> stagingBuffers;
-        
+        size_t currentStagingBatchBytes = 0;
+        const size_t STAGING_BATCH_LIMIT_BYTES = 64 * 1024 * 1024;
+
+        // One-shot event for load-time fences
+        HANDLE loadFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+
         if (m_dxEngine) {
             m_dxEngine->GetDevice()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&allocator));
             m_dxEngine->GetDevice()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.Get(), nullptr, IID_PPV_ARGS(&list));
@@ -121,18 +252,20 @@ namespace DirectLLM {
             }
 
             size_t sizeInBytes = tensor.DataSize;
-            
+
             DeviceLocation loc = DeviceLocation::GPU_VRAM;
+            // token_embd always on CPU for fast direct lookup without GPU roundtrip
             if (!m_dxEngine || name.find("token_embd") != std::string::npos) {
                 loc = DeviceLocation::CPU_SystemRAM;
             }
 
-            // Split Memory Loading: enforce VRAM budget allocation limit
+            // VRAM budget enforcement
             if (loc == DeviceLocation::GPU_VRAM && m_config.EnableSystemRamOffload) {
                 size_t limitBytes = (size_t)(m_config.VramAllocationLimitMB * 1024.0f * 1024.0f);
                 if (m_vramUsageBytes + sizeInBytes > limitBytes) {
-                    std::cout << "[ModelPipeline][SplitLoad] VRAM budget exceeded (" << (m_vramUsageBytes / (1024 * 1024))
-                              << " MB / " << m_config.VramAllocationLimitMB << " MB) for " << name 
+                    std::cout << "[ModelPipeline][SplitLoad] VRAM budget exceeded ("
+                              << (m_vramUsageBytes / (1024 * 1024)) << " MB / "
+                              << m_config.VramAllocationLimitMB << " MB) for " << name
                               << ". Offloading to CPU System RAM." << std::endl;
                     loc = DeviceLocation::CPU_SystemRAM;
                 }
@@ -140,18 +273,18 @@ namespace DirectLLM {
 
             if (!AllocateTensor(t, sizeInBytes, loc)) {
                 std::cerr << "[ModelPipeline] Failed to allocate tensor: " << name << std::endl;
+                CloseHandle(loadFenceEvent);
                 return false;
             }
 
             if (loc == DeviceLocation::CPU_SystemRAM) {
-                if (tensor.DataPtr && sizeInBytes > 0) {
+                if (tensor.DataPtr && sizeInBytes > 0)
                     std::memcpy(t.CPUHostData.data(), tensor.DataPtr, sizeInBytes);
-                }
             } else {
                 if (tensor.DataPtr && sizeInBytes > 0 && list) {
                     ComPtr<ID3D12Resource> uploadBuffer;
-                    bool ok = m_dxEngine->AllocateGPUBuffer(sizeInBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, &uploadBuffer);
-                    if (ok) {
+                    if (m_dxEngine->AllocateGPUBuffer(sizeInBytes, D3D12_HEAP_TYPE_UPLOAD,
+                            D3D12_RESOURCE_STATE_GENERIC_READ, &uploadBuffer)) {
                         void* pData = nullptr;
                         uploadBuffer->Map(0, nullptr, &pData);
                         std::memcpy(pData, tensor.DataPtr, sizeInBytes);
@@ -159,14 +292,31 @@ namespace DirectLLM {
 
                         list->CopyResource(t.GPUResource.Get(), uploadBuffer.Get());
                         stagingBuffers.push_back(uploadBuffer);
+                        currentStagingBatchBytes += sizeInBytes;
+
+                        if (currentStagingBatchBytes >= STAGING_BATCH_LIMIT_BYTES) {
+                            list->Close();
+                            ID3D12CommandList* lists[] = { list.Get() };
+                            m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, lists);
+
+                            ComPtr<ID3D12Fence> fence;
+                            m_dxEngine->GetDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+                            m_dxEngine->GetComputeQueue()->Signal(fence.Get(), 1);
+                            WaitFence(fence.Get(), 1, loadFenceEvent);
+
+                            stagingBuffers.clear();
+                            currentStagingBatchBytes = 0;
+                            allocator->Reset();
+                            list->Reset(allocator.Get(), nullptr);
+                        }
                     }
                 }
             }
             m_weightTensors[name] = std::move(t);
         }
 
-        // Close, submit the batched copy list and wait once
-        if (list) {
+        // Flush remaining copies
+        if (list && currentStagingBatchBytes > 0) {
             list->Close();
             ID3D12CommandList* lists[] = { list.Get() };
             m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, lists);
@@ -174,14 +324,20 @@ namespace DirectLLM {
             ComPtr<ID3D12Fence> fence;
             m_dxEngine->GetDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
             m_dxEngine->GetComputeQueue()->Signal(fence.Get(), 1);
-            while (fence->GetCompletedValue() < 1) {
-                Sleep(1);
-            }
+            WaitFence(fence.Get(), 1, loadFenceEvent);
         }
+
+        CloseHandle(loadFenceEvent);
 
         std::cout << "[ModelPipeline] Loaded " << m_weightTensors.size() << " tensors. VRAM: "
                   << (m_vramUsageBytes / (1024 * 1024)) << " MB, System RAM: "
                   << (m_systemRamUsageBytes / (1024 * 1024)) << " MB." << std::endl;
+
+        // ---- Build the GEMM PSO exactly ONCE here so it's ready for all tokens ----
+        if (m_dxEngine) {
+            BuildGEMMPipeline();
+        }
+
         return true;
     }
 
@@ -250,6 +406,16 @@ namespace DirectLLM {
         return scored.empty() ? 0 : scored.back().second;
     }
 
+    // -------------------------------------------------------------------
+    //  RunInferenceStep — hot path, optimized for throughput
+    //  Key changes vs previous version:
+    //    1. No per-step shader compile / PSO creation (uses m_gemmPSO)
+    //    2. No per-step CommandAllocator/List creation (reuses m_inferCmdAllocator)
+    //    3. No per-step GPU buffer allocation (reuses m_xGPUBuffer etc.)
+    //    4. Single GPU submit covering upload + GEMM + copy (was 3 separate submits)
+    //    5. Event-based fence wait instead of Sleep(1) polling
+    //    6. Fixed K/N dimension assignment for lm_head weight
+    // -------------------------------------------------------------------
     bool ModelPipeline::RunInferenceStep(uint32_t batchSize,
                                           const std::vector<int32_t>& inputTokenIds,
                                           uint32_t currentSequenceOffset,
@@ -268,119 +434,187 @@ namespace DirectLLM {
 
         auto embedIt = m_weightTensors.find("token_embd.weight");
         if (embedIt == m_weightTensors.end()) embedIt = m_weightTensors.find("tok_embeddings.weight");
-        
+
         auto lmHeadIt = m_weightTensors.find("output.weight");
         if (lmHeadIt == m_weightTensors.end()) lmHeadIt = m_weightTensors.find("lm_head.weight");
 
         if (embedIt != m_weightTensors.end() && lmHeadIt != m_weightTensors.end()) {
-            const Tensor& embedTensor = embedIt->second;
+            const Tensor& embedTensor  = embedIt->second;
             const Tensor& lmHeadTensor = lmHeadIt->second;
 
-            // Lookup embedding vector on CPU
+            // --- Build embedding vector X on CPU (O(hidden) memcpy, fast) ---
             std::vector<float> x(hidden, 0.0f);
             if (!embedTensor.CPUHostData.empty()) {
                 const float* embedData = reinterpret_cast<const float*>(embedTensor.CPUHostData.data());
-                std::memcpy(x.data(), embedData + tokId * hidden, hidden * sizeof(float));
+                size_t embedRowBytes   = (size_t)hidden * sizeof(float);
+                size_t offsetBytes     = (size_t)tokId * embedRowBytes;
+                if (offsetBytes + embedRowBytes <= embedTensor.CPUHostData.size())
+                    std::memcpy(x.data(), embedData + tokId * hidden, embedRowBytes);
             }
 
-            if (lmHeadTensor.Location == DeviceLocation::GPU_VRAM && m_dxEngine) {
-                // 1. Create a GPU buffer for x (input vector) and upload it
-                Tensor X;
-                X.Shape = { 1, (size_t)hidden };
-                X.QuantType = QuantizationType::None_FP32;
-                if (AllocateTensor(X, hidden * sizeof(float), DeviceLocation::GPU_VRAM)) {
-                    ComPtr<ID3D12Resource> uploadBuffer;
-                    if (m_dxEngine->AllocateGPUBuffer(hidden * sizeof(float), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, &uploadBuffer)) {
-                        void* pData = nullptr;
-                        uploadBuffer->Map(0, nullptr, &pData);
-                        std::memcpy(pData, x.data(), hidden * sizeof(float));
-                        uploadBuffer->Unmap(0, nullptr);
+            // ----------------------------------------------------------------
+            //  GPU path: PSO built once, buffers reused, single cmd list submit
+            // ----------------------------------------------------------------
+            if (lmHeadTensor.Location == DeviceLocation::GPU_VRAM && m_dxEngine && m_gemmPSOReady) {
+                size_t hiddenBytes = (size_t)hidden * sizeof(float);
+                size_t vocabBytes  = (size_t)vocab  * sizeof(float);
 
-                        ComPtr<ID3D12CommandAllocator> allocator;
-                        m_dxEngine->GetDevice()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&allocator));
-                        ComPtr<ID3D12GraphicsCommandList> list;
-                        m_dxEngine->GetDevice()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.Get(), nullptr, IID_PPV_ARGS(&list));
+                // Ensure persistent buffers exist (only reallocates if dims changed)
+                if (!EnsurePersistentBuffers(hiddenBytes, vocabBytes)) return false;
 
-                        list->CopyResource(X.GPUResource.Get(), uploadBuffer.Get());
-                        list->Close();
+                // Write X into mapped upload buffer (no allocation, no unmap/remap needed)
+                void* pUpload = nullptr;
+                m_xUploadBuffer->Map(0, nullptr, &pUpload);
+                std::memcpy(pUpload, x.data(), hiddenBytes);
+                m_xUploadBuffer->Unmap(0, nullptr);
 
-                        ID3D12CommandList* lists[] = { list.Get() };
-                        m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, lists);
-                        
-                        ComPtr<ID3D12Fence> fence;
-                        m_dxEngine->GetDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-                        m_dxEngine->GetComputeQueue()->Signal(fence.Get(), 1);
-                        while (fence->GetCompletedValue() < 1) { Sleep(1); }
-                    }
+                // Reset the inference command allocator + list
+                m_inferCmdAllocator->Reset();
+                m_inferCmdList->Reset(m_inferCmdAllocator.Get(), m_gemmPSO.Get());
+
+                // 1. Copy X from upload heap to default heap (GPU-side X)
+                m_inferCmdList->CopyResource(m_xGPUBuffer.Get(), m_xUploadBuffer.Get());
+
+                // Barrier: transition xGPUBuffer from COPY_DEST -> SRV
+                D3D12_RESOURCE_BARRIER barrierX = {};
+                barrierX.Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrierX.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                barrierX.Transition.pResource   = m_xGPUBuffer.Get();
+                barrierX.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                barrierX.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                barrierX.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                m_inferCmdList->ResourceBarrier(1, &barrierX);
+
+                // 2. Setup GEMM constants
+                //    lm_head shape: [vocab, hidden] → K=hidden (inner dim), N=vocab (output dim)
+                struct GEMMConstants {
+                    uint32_t M = 1;
+                    uint32_t N = 0;  // output cols = vocab
+                    uint32_t K = 0;  // inner dim = hidden
+                } constants;
+                constants.M = 1;
+                // Shape[0] = vocab rows, Shape[1] = hidden cols
+                if (lmHeadTensor.Shape.size() >= 2) {
+                    constants.N = (uint32_t)lmHeadTensor.Shape[0]; // vocab (output)
+                    constants.K = (uint32_t)lmHeadTensor.Shape[1]; // hidden (inner)
+                } else {
+                    constants.N = (uint32_t)vocab;
+                    constants.K = (uint32_t)hidden;
                 }
 
-                // 2. Create a GPU buffer for Y (output logits)
-                Tensor Y;
-                Y.Shape = { 1, (size_t)vocab };
-                Y.QuantType = QuantizationType::None_FP32;
-                AllocateTensor(Y, vocab * sizeof(float), DeviceLocation::GPU_VRAM);
+                m_inferCmdList->SetComputeRootSignature(m_gemmRootSignature.Get());
+                m_inferCmdList->SetPipelineState(m_gemmPSO.Get());
+                m_inferCmdList->SetComputeRoot32BitConstants(0, 3, &constants, 0);
 
-                // 3. Dispatch GPU Matrix Multiply: X * W -> Y
-                DispatchGPUMatrixMultiply(X, lmHeadTensor, Y);
+                if (m_xGPUBuffer)
+                    m_inferCmdList->SetComputeRootShaderResourceView(1, m_xGPUBuffer->GetGPUVirtualAddress());
+                if (lmHeadTensor.GPUResource)
+                    m_inferCmdList->SetComputeRootShaderResourceView(2, lmHeadTensor.GPUResource->GetGPUVirtualAddress());
 
-                // 4. Copy Y logits back to CPU outLogits
-                ComPtr<ID3D12Resource> readbackBuffer;
-                if (m_dxEngine->AllocateGPUBuffer(vocab * sizeof(float), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, &readbackBuffer)) {
-                    ComPtr<ID3D12CommandAllocator> allocator;
-                    m_dxEngine->GetDevice()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&allocator));
-                    ComPtr<ID3D12GraphicsCommandList> list;
-                    m_dxEngine->GetDevice()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.Get(), nullptr, IID_PPV_ARGS(&list));
+                // Scales / zero-points (fall back to weight buffer if not present)
+                if (lmHeadTensor.GPUScales)
+                    m_inferCmdList->SetComputeRootShaderResourceView(3, lmHeadTensor.GPUScales->GetGPUVirtualAddress());
+                else if (lmHeadTensor.GPUResource)
+                    m_inferCmdList->SetComputeRootShaderResourceView(3, lmHeadTensor.GPUResource->GetGPUVirtualAddress());
 
-                    list->CopyResource(readbackBuffer.Get(), Y.GPUResource.Get());
-                    list->Close();
+                if (lmHeadTensor.GPUZeroPoints)
+                    m_inferCmdList->SetComputeRootShaderResourceView(4, lmHeadTensor.GPUZeroPoints->GetGPUVirtualAddress());
+                else if (lmHeadTensor.GPUResource)
+                    m_inferCmdList->SetComputeRootShaderResourceView(4, lmHeadTensor.GPUResource->GetGPUVirtualAddress());
 
-                    ID3D12CommandList* lists[] = { list.Get() };
-                    m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, lists);
+                if (m_yGPUBuffer)
+                    m_inferCmdList->SetComputeRootUnorderedAccessView(5, m_yGPUBuffer->GetGPUVirtualAddress());
 
-                    ComPtr<ID3D12Fence> fence;
-                    m_dxEngine->GetDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-                    m_dxEngine->GetComputeQueue()->Signal(fence.Get(), 1);
-                    while (fence->GetCompletedValue() < 1) { Sleep(1); }
+                // Thread group dispatch: cover (vocab x 1) output
+                uint32_t threadGroupsX = (constants.N + 15) / 16;
+                uint32_t threadGroupsY = 1; // M=1 (single token)
+                m_inferCmdList->Dispatch(threadGroupsX, threadGroupsY, 1);
 
-                    void* pData = nullptr;
-                    readbackBuffer->Map(0, nullptr, &pData);
-                    std::memcpy(outLogits.data(), pData, vocab * sizeof(float));
-                    readbackBuffer->Unmap(0, nullptr);
-                }
+                // 3. UAV barrier then copy Y to readback
+                D3D12_RESOURCE_BARRIER barrierUAV = {};
+                barrierUAV.Type  = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                barrierUAV.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                barrierUAV.UAV.pResource = m_yGPUBuffer.Get();
+                m_inferCmdList->ResourceBarrier(1, &barrierUAV);
+
+                D3D12_RESOURCE_BARRIER barrierY = {};
+                barrierY.Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrierY.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                barrierY.Transition.pResource   = m_yGPUBuffer.Get();
+                barrierY.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                barrierY.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                barrierY.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                m_inferCmdList->ResourceBarrier(1, &barrierY);
+
+                m_inferCmdList->CopyResource(m_yReadbackBuffer.Get(), m_yGPUBuffer.Get());
+
+                // Transition Y back to UAV for next step
+                D3D12_RESOURCE_BARRIER barrierYBack = {};
+                barrierYBack.Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrierYBack.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                barrierYBack.Transition.pResource   = m_yGPUBuffer.Get();
+                barrierYBack.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                barrierYBack.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                barrierYBack.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                m_inferCmdList->ResourceBarrier(1, &barrierYBack);
+
+                // Transition X back to COPY_DEST for next step
+                D3D12_RESOURCE_BARRIER barrierXBack = {};
+                barrierXBack.Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrierXBack.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                barrierXBack.Transition.pResource   = m_xGPUBuffer.Get();
+                barrierXBack.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                barrierXBack.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+                barrierXBack.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                m_inferCmdList->ResourceBarrier(1, &barrierXBack);
+
+                m_inferCmdList->Close();
+
+                // Single submit covers: upload copy + GEMM dispatch + readback copy
+                ID3D12CommandList* lists[] = { m_inferCmdList.Get() };
+                m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, lists);
+
+                // Wait via event (no Sleep polling)
+                m_inferFenceValue++;
+                m_dxEngine->GetComputeQueue()->Signal(m_inferFence.Get(), m_inferFenceValue);
+                WaitFence(m_inferFence.Get(), m_inferFenceValue, m_inferFenceEvent);
+
+                // Map readback and copy to outLogits
+                void* pData = nullptr;
+                m_yReadbackBuffer->Map(0, nullptr, &pData);
+                std::memcpy(outLogits.data(), pData, vocabBytes);
+                m_yReadbackBuffer->Unmap(0, nullptr);
+
+                m_gpuDispatchedOperators++;
                 return true;
+
             } else {
-                // CPU fallback loop
+                // ---- CPU fallback (when lm_head is offloaded to RAM) ----
                 if (!lmHeadTensor.CPUHostData.empty()) {
-                    const float* lmHeadData = reinterpret_cast<const float*>(lmHeadTensor.CPUHostData.data());
+                    const float* W = reinterpret_cast<const float*>(lmHeadTensor.CPUHostData.data());
+                    // W layout: [vocab, hidden] — row-major
                     for (int j = 0; j < vocab; j++) {
                         float sum = 0.0f;
-                        for (int i = 0; i < hidden; i++) {
-                            sum += x[i] * lmHeadData[j * hidden + i];
-                        }
+                        const float* row = W + (size_t)j * hidden;
+                        for (int i = 0; i < hidden; i++) sum += x[i] * row[i];
                         outLogits[j] = sum;
                     }
+                    m_cpuDispatchedOperators++;
                     return true;
                 }
             }
         }
 
-        // Vocabulary-based fallback: select related tokens from the real GGUF vocabulary
-        // Uses the 248K-token vocabulary to produce coherent-looking output
-        uint32_t seed = (uint32_t)(tokId * 2654435761u + currentSequenceOffset * 1664525u);
+        // ---- Last-resort vocabulary-based fallback (no weights loaded) ----
         int prevTok = (int)inputTokenIds.size() > 1 ? inputTokenIds[inputTokenIds.size() - 2] : tokId;
 
-        // Score tokens by proximity to current token
         for (int i = 0; i < vocab; i++) {
             int diff = std::abs(i - tokId);
-            if (diff < 100) outLogits[i] = (100.0f - diff) * 0.05f;
-            else if (diff < 1000) outLogits[i] = (1000.0f - diff) * 0.005f;
+            if (diff < 100)   outLogits[i] = (100.0f - diff) * 0.05f;
+            else if (diff < 1000)  outLogits[i] = (1000.0f - diff)  * 0.005f;
             else if (diff < 10000) outLogits[i] = (10000.0f - diff) * 0.0005f;
         }
-
-        // Boost common grammatical tokens (low IDs = frequent tokens)
         for (int i = 10; i < 200; i++) outLogits[i] += 0.3f;
-
-        // Boost tokens near previous token for continuity
         for (int i = 0; i < vocab; i++) {
             int diff = std::abs(i - prevTok);
             if (diff < 50) outLogits[i] += (50.0f - diff) * 0.03f;
@@ -393,122 +627,63 @@ namespace DirectLLM {
         m_weightTensors.clear();
         m_vramUsageBytes = 0;
         m_systemRamUsageBytes = 0;
+        m_gemmPSOReady = false;
+        m_persistentHiddenBytes = 0;
+        m_persistentVocabBytes  = 0;
     }
 
     bool ModelPipeline::DispatchGPUMatrixMultiply(const Tensor& X, const Tensor& W, Tensor& Y) {
-        if (!m_dxEngine) return false;
-        
+        // This is now only called for non-inference-step use (e.g., layer FFN dispatch).
+        // The inference hot path uses the cached PSO + persistent buffers in RunInferenceStep.
+        if (!m_dxEngine || !m_gemmPSOReady) return false;
+
         m_gpuDispatchedOperators++;
-
-        ComPtr<ID3DBlob> shaderBlob;
-        bool compileOk = m_dxEngine->CompileComputeShader(L"shaders/QuantizedGEMM.hlsl", "main", &shaderBlob);
-        if (!compileOk) return false;
-
-        D3D12_ROOT_PARAMETER rootParameters[6] = {};
-        
-        rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        rootParameters[0].Constants.ShaderRegister = 0;
-        rootParameters[0].Constants.RegisterSpace = 0;
-        rootParameters[0].Constants.Num32BitValues = 3;
-        rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        rootParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        rootParameters[1].Descriptor.ShaderRegister = 0;
-        rootParameters[1].Descriptor.RegisterSpace = 0;
-        rootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        rootParameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        rootParameters[2].Descriptor.ShaderRegister = 1;
-        rootParameters[2].Descriptor.RegisterSpace = 0;
-        rootParameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        rootParameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        rootParameters[3].Descriptor.ShaderRegister = 2;
-        rootParameters[3].Descriptor.RegisterSpace = 0;
-        rootParameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        rootParameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        rootParameters[4].Descriptor.ShaderRegister = 3;
-        rootParameters[4].Descriptor.RegisterSpace = 0;
-        rootParameters[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        rootParameters[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        rootParameters[5].Descriptor.ShaderRegister = 0;
-        rootParameters[5].Descriptor.RegisterSpace = 0;
-        rootParameters[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-        rootSigDesc.NumParameters = 6;
-        rootSigDesc.pParameters = rootParameters;
-        rootSigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-
-        ComPtr<ID3DBlob> serializedSignature;
-        ComPtr<ID3DBlob> errorBlob;
-        HRESULT hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &serializedSignature, &errorBlob);
-        if (FAILED(hr)) return false;
-
-        ComPtr<ID3D12RootSignature> rootSignature;
-        hr = m_dxEngine->GetDevice()->CreateRootSignature(0, serializedSignature->GetBufferPointer(), serializedSignature->GetBufferSize(), IID_PPV_ARGS(&rootSignature));
-        if (FAILED(hr)) return false;
-
-        ComPtr<ID3D12PipelineState> pso;
-        bool psoOk = m_dxEngine->CreateComputePipelineState(shaderBlob.Get(), rootSignature.Get(), &pso);
-        if (!psoOk) return false;
 
         ComPtr<ID3D12CommandAllocator> allocator;
         m_dxEngine->GetDevice()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&allocator));
         ComPtr<ID3D12GraphicsCommandList> list;
-        m_dxEngine->GetDevice()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.Get(), pso.Get(), IID_PPV_ARGS(&list));
+        m_dxEngine->GetDevice()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+            allocator.Get(), m_gemmPSO.Get(), IID_PPV_ARGS(&list));
 
-        list->SetComputeRootSignature(rootSignature.Get());
+        list->SetComputeRootSignature(m_gemmRootSignature.Get());
+        list->SetPipelineState(m_gemmPSO.Get());
 
         struct GEMMConstants {
             uint32_t M = 1;
             uint32_t N = 4096;
             uint32_t K = 4096;
         } constants;
-        
+
         if (!X.Shape.empty()) constants.M = (uint32_t)X.Shape[0];
         if (W.Shape.size() >= 2) {
-            constants.K = (uint32_t)W.Shape[0];
-            constants.N = (uint32_t)W.Shape[1];
+            constants.N = (uint32_t)W.Shape[0]; // output rows
+            constants.K = (uint32_t)W.Shape[1]; // inner dim
         }
 
         list->SetComputeRoot32BitConstants(0, 3, &constants, 0);
-
         if (X.GPUResource) list->SetComputeRootShaderResourceView(1, X.GPUResource->GetGPUVirtualAddress());
         if (W.GPUResource) list->SetComputeRootShaderResourceView(2, W.GPUResource->GetGPUVirtualAddress());
-        if (W.GPUScales) {
-            list->SetComputeRootShaderResourceView(3, W.GPUScales->GetGPUVirtualAddress());
-        } else if (W.GPUResource) {
-            list->SetComputeRootShaderResourceView(3, W.GPUResource->GetGPUVirtualAddress());
-        }
-        if (W.GPUZeroPoints) {
-            list->SetComputeRootShaderResourceView(4, W.GPUZeroPoints->GetGPUVirtualAddress());
-        } else if (W.GPUResource) {
-            list->SetComputeRootShaderResourceView(4, W.GPUResource->GetGPUVirtualAddress());
-        }
+        if (W.GPUScales)   list->SetComputeRootShaderResourceView(3, W.GPUScales->GetGPUVirtualAddress());
+        else if (W.GPUResource) list->SetComputeRootShaderResourceView(3, W.GPUResource->GetGPUVirtualAddress());
+        if (W.GPUZeroPoints) list->SetComputeRootShaderResourceView(4, W.GPUZeroPoints->GetGPUVirtualAddress());
+        else if (W.GPUResource) list->SetComputeRootShaderResourceView(4, W.GPUResource->GetGPUVirtualAddress());
         if (Y.GPUResource) list->SetComputeRootUnorderedAccessView(5, Y.GPUResource->GetGPUVirtualAddress());
 
         uint32_t threadGroupsX = (constants.N + 15) / 16;
         uint32_t threadGroupsY = (constants.M + 15) / 16;
         list->Dispatch(threadGroupsX, threadGroupsY, 1);
-
         list->Close();
 
         ID3D12CommandList* lists[] = { list.Get() };
         m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, lists);
 
+        HANDLE evt = CreateEvent(nullptr, FALSE, FALSE, nullptr);
         ComPtr<ID3D12Fence> fence;
         m_dxEngine->GetDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
         m_dxEngine->GetComputeQueue()->Signal(fence.Get(), 1);
-        while (fence->GetCompletedValue() < 1) {
-            Sleep(1);
-        }
+        WaitFence(fence.Get(), 1, evt);
+        CloseHandle(evt);
 
-        std::cout << "[ModelPipeline][GPU] Dispatched GEMM Compute Shader: Input (" << constants.M << "x" << constants.K 
-                  << ") * Weight (" << constants.K << "x" << constants.N << ")" << std::endl;
-        
         return true;
     }
 
