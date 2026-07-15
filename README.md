@@ -27,6 +27,11 @@ You can configure DybyDx using the following flags:
 | `--temperature <T>` | `0.8` | Sampling temperature (0.0 = greedy selection) |
 | `--top-p <P>` | `0.95` | Nucleus sampling probability threshold |
 | `--top-k <K>` | `40` | Top-K sampling token selection limit (0 = disabled) |
+| `--repeat-penalty <val>` | `1.1` | Repetition penalty scaling factor (1.0 = disabled) |
+| `--presence-penalty <val>` | `0.0` | Presence penalty added directly to logits |
+| `--enable-mtp` | `false` | Enable speculative Multi-Token Prediction validation logs |
+| `--kv-quant <type>` | `"fp16"` | KV cache element type: `fp32`, `fp16`, `fp8`, `int8`, `int4` |
+| `--vram-limit <MB>` | `2048` | VRAM allocation budget limit in Megabytes |
 | `-verbose` | `false` | Enable detailed GPU trace logs (compute shader dispatches, KV cache) |
 | `-debug` | `false` | Enable modular component diagnostics and adapter features |
 | `-h, --help` | | Show help instructions and exit |

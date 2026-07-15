@@ -22,6 +22,7 @@ namespace DirectLLM {
         uint32_t BatchSize;
         uint32_t NumHeads;
         uint32_t HeadDimension;
+        KVCacheQuantType QuantType = KVCacheQuantType::None_FP16;
     };
 
     class KVCacheManager {

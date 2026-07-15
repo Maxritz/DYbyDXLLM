@@ -16,9 +16,18 @@ namespace DirectLLM {
         m_config = config;
         m_sequenceLengths.assign(config.BatchSize, 0);
 
-        // Size computation: BatchSize * MaxSequenceLength * NumHeads * HeadDimension * sizeof(FP16)
+        // Size computation based on cache quantization type
         size_t numElements = (size_t)config.BatchSize * config.MaxSequenceLength * config.NumHeads * config.HeadDimension;
-        m_bufferSizeInBytes = numElements * 2; // float16 = 2 bytes
+        
+        float bytesPerElement = 2.0f;
+        switch (config.QuantType) {
+            case KVCacheQuantType::None_FP32: bytesPerElement = 4.0f; break;
+            case KVCacheQuantType::None_FP16: bytesPerElement = 2.0f; break;
+            case KVCacheQuantType::FP8:
+            case KVCacheQuantType::INT8:      bytesPerElement = 1.0f; break;
+            case KVCacheQuantType::INT4:      bytesPerElement = 0.5f; break;
+        }
+        m_bufferSizeInBytes = (size_t)(numElements * bytesPerElement);
 
         // Allocating large Default Heap Buffers (GPU high-speed memory)
         D3D12_HEAP_PROPERTIES heapProps = {};

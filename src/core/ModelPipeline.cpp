@@ -92,6 +92,17 @@ namespace DirectLLM {
                 loc = DeviceLocation::CPU_SystemRAM;
             }
 
+            // Split Memory Loading: enforce VRAM budget allocation limit
+            if (loc == DeviceLocation::GPU_VRAM && m_config.EnableSystemRamOffload) {
+                size_t limitBytes = (size_t)(m_config.VramAllocationLimitMB * 1024.0f * 1024.0f);
+                if (m_vramUsageBytes + sizeInBytes > limitBytes) {
+                    std::cout << "[ModelPipeline][SplitLoad] VRAM budget exceeded (" << (m_vramUsageBytes / (1024 * 1024))
+                              << " MB / " << m_config.VramAllocationLimitMB << " MB) for " << name 
+                              << ". Offloading to CPU System RAM." << std::endl;
+                    loc = DeviceLocation::CPU_SystemRAM;
+                }
+            }
+
             if (!AllocateTensor(t, sizeInBytes, loc)) {
                 std::cerr << "[ModelPipeline] Failed to allocate tensor: " << name << std::endl;
                 return false;
