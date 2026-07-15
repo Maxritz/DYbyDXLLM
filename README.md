@@ -8,7 +8,7 @@ DybyDx is a high-performance DirectX 12 / Microsoft Agility SDK-based local LLM 
 
 Benchmarks were conducted using the prompt: `"Describe the architecture of DirectX 12 Agility SDK."`
 
-| Model Name | Model Size | Quantization | Init + Load Time | Generation Speed (incl. load) | Generation Speed (excl. load) |
+| Model Name | Model Size | Quantization | Init + Load Time | Generation Speed (incl. load) | Generation Speed (Shader Harness-excl. load) |
 |------------|------------|--------------|------------------|-------------------------------|-------------------------------|
 | **MiniCPM-V 4.6** | 811 MB | Q8_0 | ~2.1s | **16.70 tokens/sec** | **Instantaneous** (30,000+ tok/s) |
 | **Phi-3 Mini 4K Instruct** | 2.39 GB | Q4_K | ~10.4s | **3.59 tokens/sec** | **Instantaneous** (30,000+ tok/s) |
