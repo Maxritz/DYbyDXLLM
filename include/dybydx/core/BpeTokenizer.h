@@ -7,12 +7,15 @@
 
 namespace DirectLLM {
 
+    class GgufLoader; // forward declaration
+
     class BpeTokenizer {
     public:
         BpeTokenizer();
         ~BpeTokenizer();
 
         bool LoadVocabulary(const std::string& vocabPath);
+        bool LoadFromGGUF(const GgufLoader& loader);
         
         std::vector<int32_t> Encode(const std::string& text);
         std::string Decode(const std::vector<int32_t>& ids);

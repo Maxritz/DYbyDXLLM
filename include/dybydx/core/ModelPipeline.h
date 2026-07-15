@@ -7,7 +7,7 @@
 #include <vector>
 #include <unordered_map>
 #include <memory>
-#include "DirectXEngine.h"
+#include "dybydx/core/DirectXEngine.h"
 #include "dybydx/core/KVCacheManager.h"
 
 namespace DirectLLM {
@@ -138,6 +138,9 @@ namespace DirectLLM {
         DirectXEngine* m_dxEngine = nullptr;
         ModelConfig m_config;
         std::vector<TransformerLayer> m_layers;
+        
+        // GGUF-loaded weight tensors
+        std::unordered_map<std::string, Tensor> m_weightTensors;
         
         // Global word embedding and final language-model head
         Tensor m_embedTokens;

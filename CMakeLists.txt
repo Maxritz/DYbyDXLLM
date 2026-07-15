@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-set(CORE_SOURCES
+set(SOURCES
     src/core/DirectXEngine.cpp
     src/core/KVCacheManager.cpp
     src/core/BpeTokenizer.cpp
@@ -20,39 +20,35 @@ set(CORE_SOURCES
 
 set(DIRECTSTORAGE_DIR "C:/Users/rina0423/Desktop/DX/directstorage")
 
-add_executable(DybyDx
-    cli/main.cpp
-    ${CORE_SOURCES}
-)
+# Native DLL for C# CLI P/Invoke
+add_library(DirectLLM.Core SHARED ${SOURCES})
+target_include_directories(DirectLLM.Core PRIVATE include ${DIRECTSTORAGE_DIR}/native/include)
+target_link_directories(DirectLLM.Core PRIVATE ${DIRECTSTORAGE_DIR}/native/lib/x64)
+target_link_libraries(DirectLLM.Core PRIVATE d3d12 dxgi d3dcompiler dstorage)
 
-target_include_directories(DybyDx PRIVATE
-    include
-    ${DIRECTSTORAGE_DIR}/native/include
-)
+# C++ CLI executable
+add_executable(DybyDx cli/main.cpp ${SOURCES})
+target_include_directories(DybyDx PRIVATE include ${DIRECTSTORAGE_DIR}/native/include)
+target_link_directories(DybyDx PRIVATE ${DIRECTSTORAGE_DIR}/native/lib/x64)
+target_link_libraries(DybyDx PRIVATE d3d12 dxgi d3dcompiler dstorage)
 
-target_link_directories(DybyDx PRIVATE
-    ${DIRECTSTORAGE_DIR}/native/lib/x64
-)
+# Post-build: copy shaders and DirectStorage DLLs
+foreach(TGT DirectLLM.Core DybyDx)
+    add_custom_command(TARGET ${TGT} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
+            "$<TARGET_FILE_DIR:${TGT}>/shaders"
+        COMMENT "Copying HLSL shaders to ${TGT} output..."
+    )
+    add_custom_command(TARGET ${TGT} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${DIRECTSTORAGE_DIR}/native/bin/x64/dstorage.dll"
+            "$<TARGET_FILE_DIR:${TGT}>/dstorage.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${DIRECTSTORAGE_DIR}/native/bin/x64/dstoragecore.dll"
+            "$<TARGET_FILE_DIR:${TGT}>/dstoragecore.dll"
+        COMMENT "Copying DirectStorage runtime DLLs to ${TGT}..."
+    )
+endforeach()
 
-target_link_libraries(DybyDx PRIVATE
-    d3d12 dxgi d3dcompiler dstorage
-)
-
-add_custom_command(TARGET DybyDx POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
-        "$<TARGET_FILE_DIR:DybyDx>/shaders"
-    COMMENT "Copying HLSL shaders to output..."
-)
-
-add_custom_command(TARGET DybyDx POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${DIRECTSTORAGE_DIR}/native/bin/x64/dstorage.dll"
-        "$<TARGET_FILE_DIR:DybyDx>/dstorage.dll"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${DIRECTSTORAGE_DIR}/native/bin/x64/dstoragecore.dll"
-        "$<TARGET_FILE_DIR:DybyDx>/dstoragecore.dll"
-    COMMENT "Copying DirectStorage runtime DLLs..."
-)
-
-message(STATUS "DybyDx configured. Target: DybyDx.exe")
+message(STATUS "DybyDx configured. Targets: DirectLLM.Core.dll + DybyDx.exe")

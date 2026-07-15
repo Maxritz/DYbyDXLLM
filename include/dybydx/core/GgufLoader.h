@@ -80,6 +80,7 @@ namespace DirectLLM {
 
         const GgufTensor* GetTensor(const std::string& name) const;
         const std::unordered_map<std::string, GgufTensor>& GetTensors() const { return m_tensors; }
+        const std::unordered_map<std::string, GgufValue>& GetAllMetadata() const { return m_metadata; }
 
         uint32_t GetVersion() const { return m_version; }
         uint64_t GetTensorCount() const { return m_tensorCount; }
