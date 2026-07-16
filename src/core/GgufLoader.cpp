@@ -40,12 +40,12 @@ namespace DirectLLM {
             case GgmlType::Q5_1: return (elements / 32) * 24;
             case GgmlType::Q8_0: return (elements / 32) * 34;
             case GgmlType::Q8_1: return (elements / 32) * 40;
-            case GgmlType::Q2_K: return elements / 4;
-            case GgmlType::Q3_K: return (elements * 3) / 8;
-            case GgmlType::Q4_K: return elements / 2;
-            case GgmlType::Q5_K: return (elements * 5) / 8;
-            case GgmlType::Q6_K: return (elements * 6) / 8;
-            case GgmlType::Q8_K: return elements;
+            case GgmlType::Q2_K: return (elements / 256) * 84;
+            case GgmlType::Q3_K: return (elements / 256) * 110;
+            case GgmlType::Q4_K: return (elements / 256) * 144;
+            case GgmlType::Q5_K: return (elements / 256) * 176;
+            case GgmlType::Q6_K: return (elements / 256) * 210;
+            case GgmlType::Q8_K: return (elements / 256) * 292;
             default:             return elements * 2;
         }
     }
