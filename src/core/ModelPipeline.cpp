@@ -624,6 +624,122 @@ std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " 
     static float SiLU(float x) { return x / (1.0f + std::exp(-x)); }
 
     // ================================================================
+    //  Q4_K/Q5_K scale unpacking helper (K_SCALE_SIZE = 12)
+    //  Layout: scales[12] where bytes 0-3 contain scales, bytes 4-7 contain mins,
+    //  and bytes 8-11 contain combined d/m data for the second half
+    // ================================================================
+    static void get_scale_min_k4(int is, const uint8_t* scales, uint8_t& sc, uint8_t& m) {
+        if (is < 8) {
+            uint8_t tmp = scales[3 + is / 2];
+            sc = (scales[is] & 0x0F) | ((tmp >> 4) & 0x0F) << 4;
+            m  = (scales[is] & 0xF0) >> 4;
+        } else {
+            int i = is - 8;
+            uint8_t tmp = scales[3 + i / 2];
+            sc = (scales[4 + i] & 0x0F) | ((tmp >> 4) & 0x0F) << 4;
+            m  = (scales[4 + i] & 0xF0) >> 4;
+        }
+    }
+
+    // ================================================================
+    //  Q4_K dequantization (QK_K = 256 weights per block)
+    //  Block format: dm[4B] + scales[12B] + qs[128B]
+    // ================================================================
+    static void DequantizeQ4_K(const uint8_t* blockPtr, float* outVec) {
+        uint16_t dm_raw[2];
+        std::memcpy(dm_raw, blockPtr, 4);
+        float dall = FP16ToFloat(dm_raw[0]);
+        float dmin = FP16ToFloat(dm_raw[1]);
+        const uint8_t* scales = blockPtr + 4;
+        const uint8_t* qs = blockPtr + 4 + 12;
+
+        for (int i = 0; i < 256; ++i) {
+            int il = i / 64;
+            int in = i % 64;
+            int is = 2 * il + (in >= 32 ? 1 : 0);
+            int off = in & 31;
+            int qsi = 32 * il + off;
+
+            uint8_t sc, mn;
+            get_scale_min_k4(is, scales, sc, mn);
+
+            uint8_t q = qs[qsi];
+            uint8_t qv = (in >= 32) ? (q >> 4) : (q & 0x0F);
+            outVec[i] = dall * sc * qv - dmin * mn;
+        }
+    }
+
+    // ================================================================
+    //  Q5_K dequantization (QK_K = 256 weights per block)
+    //  Block format: dm[4B] + scales[12B] + qh[32B] + qs[128B]
+    // ================================================================
+    static void DequantizeQ5_K(const uint8_t* blockPtr, float* outVec) {
+        uint16_t dm_raw[2];
+        std::memcpy(dm_raw, blockPtr, 4);
+        float dall = FP16ToFloat(dm_raw[0]);
+        float dmin = FP16ToFloat(dm_raw[1]);
+        const uint8_t* scales = blockPtr + 4;
+        const uint8_t* qh = blockPtr + 4 + 12;
+        const uint8_t* qs = blockPtr + 4 + 12 + 32;
+
+        for (int i = 0; i < 256; ++i) {
+            int il = i / 64;
+            int in = i % 64;
+            int is = 2 * il + (in >= 32 ? 1 : 0);
+            int ir = (in & 31) / 2;
+            int iq = in & 1;
+
+            uint8_t sc, mn;
+            get_scale_min_k4(is, scales, sc, mn);
+
+            uint8_t q = qs[32 * il + 2 * ir + iq];
+            uint8_t h = qh[2 * ir + iq];
+            uint8_t qv = (in >= 32) ? (q >> 4) : (q & 0x0F);
+            uint8_t hm = 1 << (2 * il + (in >= 32 ? 1 : 0));
+
+            outVec[i] = dall * sc * ((qv + ((h & hm) ? 16 : 0))) - dmin * mn;
+        }
+    }
+
+    // ================================================================
+    //  Q6_K dequantization (QK_K = 256 weights per block)
+    //  Block format: ql[128B] + qh[64B] + scales[16B] + d[2B]
+    // ================================================================
+    static void DequantizeQ6_K(const uint8_t* blockPtr, float* outVec) {
+        const uint8_t* ql = blockPtr;
+        const uint8_t* qh = blockPtr + 128;
+        const int8_t* scales = reinterpret_cast<const int8_t*>(blockPtr + 128 + 64);
+        uint16_t d_raw;
+        std::memcpy(&d_raw, blockPtr + 128 + 64 + 16, 2);
+        float d = FP16ToFloat(d_raw);
+
+        for (int i = 0; i < 256; ++i) {
+            int ip = i / 128;
+            int in = i % 128;
+            int il = in & 31;
+            int ig = in / 32;
+            int is = 8 * ip + il / 16;
+
+            uint8_t ql0 = ql[64 * ip + il];
+            uint8_t ql1 = ql[64 * ip + il + 32];
+            uint8_t qh_val = qh[32 * ip + il];
+            int8_t scale = scales[is];
+
+            int8_t qv;
+            if (ig == 0) {
+                qv = (ql0 & 0xF) | (((qh_val >> 0) & 3) << 4);
+            } else if (ig == 1) {
+                qv = (ql1 & 0xF) | (((qh_val >> 2) & 3) << 4);
+            } else if (ig == 2) {
+                qv = (ql0 >> 4) | (((qh_val >> 4) & 3) << 4);
+            } else {
+                qv = (ql1 >> 4) | (((qh_val >> 6) & 3) << 4);
+            }
+            outVec[i] = d * scale * (qv - 32);
+        }
+    }
+
+    // ================================================================
     //  Sampler
     // ================================================================
     static int Sample(float* logits, int vocabSize, float temp, float topP, int topK) {
@@ -745,6 +861,30 @@ std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " 
                             x[b * 32 + j] = (float)nibble * scale;
                         }
                     }
+                } else if (embedTensor->QuantType == QuantizationType::Q4_K) {
+                    const uint8_t* embedData = embedTensor->CPUHostData.data();
+                    size_t blocksPerRow = (size_t)hidden / 256;
+                    size_t blockBytes = 4 + 12 + 128; // dm[4] + scales[12] + qs[128]
+                    for (size_t b = 0; b < blocksPerRow; ++b) {
+                        size_t blockOffset = ((size_t)tokId * blocksPerRow + b) * blockBytes;
+                        DequantizeQ4_K(embedData + blockOffset, x.data() + b * 256);
+                    }
+                } else if (embedTensor->QuantType == QuantizationType::Q5_K) {
+                    const uint8_t* embedData = embedTensor->CPUHostData.data();
+                    size_t blocksPerRow = (size_t)hidden / 256;
+                    size_t blockBytes = 4 + 12 + 32 + 128; // dm[4] + scales[12] + qh[32] + qs[128]
+                    for (size_t b = 0; b < blocksPerRow; ++b) {
+                        size_t blockOffset = ((size_t)tokId * blocksPerRow + b) * blockBytes;
+                        DequantizeQ5_K(embedData + blockOffset, x.data() + b * 256);
+                    }
+                } else if (embedTensor->QuantType == QuantizationType::Q6_K) {
+                    const uint8_t* embedData = embedTensor->CPUHostData.data();
+                    size_t blocksPerRow = (size_t)hidden / 256;
+                    size_t blockBytes = 128 + 64 + 16 + 2; // ql[128] + qh[64] + scales[16] + d[2]
+                    for (size_t b = 0; b < blocksPerRow; ++b) {
+                        size_t blockOffset = ((size_t)tokId * blocksPerRow + b) * blockBytes;
+                        DequantizeQ6_K(embedData + blockOffset, x.data() + b * 256);
+                    }
                 } else {
                     const float* embedData = reinterpret_cast<const float*>(embedTensor->CPUHostData.data());
                     size_t rowBytes = (size_t)hidden * sizeof(float);
@@ -761,24 +901,103 @@ std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " 
                 for (size_t layerIdx = 0; layerIdx < m_config.NumLayers; ++layerIdx) {
                     const auto& layer = m_layers[layerIdx];
 
-                    // RMSNorm before attention
-                    if (!layer.Attn_Norm.CPUHostData.empty()) {
-                        const float* normW = reinterpret_cast<const float*>(layer.Attn_Norm.CPUHostData.data());
-                        std::vector<float> normX(hidden);
-                        RMSNorm(normX.data(), x.data(), (int)hidden, 1e-5f);
-                        for (size_t i = 0; i < hidden; ++i) x[i] = normX[i] * normW[i];
-                    }
+// RMSNorm before attention
+                     if (!layer.Attn_Norm.CPUHostData.empty()) {
+                         const float* normW = reinterpret_cast<const float*>(layer.Attn_Norm.CPUHostData.data());
+                         std::vector<float> normX(hidden);
+                         RMSNorm(normX.data(), x.data(), (int)hidden, 1e-5f);
+                         for (size_t i = 0; i < hidden; ++i) x[i] = normX[i] * normW[i];
+                     }
 
-                    // QKV projection
-                    if (!layer.QKV_Proj.CPUHostData.empty()) {
-                        std::vector<float> qkvOut(hidden * 3, 0.0f);
-                        // Placeholder - real implementation needs matrix multiply dispatch
-                    }
+                     // QKV projection -> fused attention -> O projection
+                     if (!layer.QKV_Proj.CPUHostData.empty()) {
+                         int seqLen = (int)m_kvCache.GetSequenceLength(0) + 1;
+                         int nHeads = (int)m_config.NumHeads;
+                         int nKVHeads = nHeads; // GQA: could be nHeads / nRepeats
+                         int headDim = (int)m_config.HeadDim;
+                         int qDim = headDim;
+                         int kvDim = headDim;
 
-                    // O projection after attention
-                    if (!layer.O_Proj.CPUHostData.empty()) {
-                        // Placeholder - would need attention output
-                    }
+                         // Combined QKV matrix: shape [hidden, 3*hidden] or column-wise access
+                         Tensor xTensor, qkvTensor, attnOutTensor;
+                         xTensor.Shape = { (size_t)hidden, 1 };
+                         xTensor.CPUHostData.resize(hidden * sizeof(float));
+                         std::memcpy(xTensor.CPUHostData.data(), x.data(), hidden * sizeof(float));
+                         xTensor.Location = DeviceLocation::CPU_SystemRAM;
+
+                         qkvTensor = layer.QKV_Proj;
+                         qkvTensor.Shape = { (size_t)hidden, (size_t)(hidden * 3) };
+
+                         // QKV output: [seq, numHeads, headDim * 3] for reshaping
+                         std::vector<float> qkvOut(hidden * 3, 0.0f);
+                         attnOutTensor.Shape = { (size_t)(hidden * 3), 1 };
+                         attnOutTensor.CPUHostData.resize((hidden * 3) * sizeof(float));
+
+                         if (layer.PrimaryLocation == DeviceLocation::GPU_VRAM && m_dxEngine && m_gemmPSOReady) {
+                             // GPU path: use DispatchGPUMatrixMultiply for QKV
+                             Tensor yTmp;
+                             yTmp.CPUHostData.resize((hidden * 3) * sizeof(float));
+                             yTmp.Shape = { (size_t)(hidden * 3), 1 };
+                             DispatchGPUMatrixMultiply(xTensor, qkvTensor, yTmp);
+                             std::memcpy(qkvOut.data(), yTmp.CPUHostData.data(), (hidden * 3) * sizeof(float));
+                         } else {
+                             // CPU path: dequantize QKV weights and compute
+                             DispatchCPUMatrixMultiplyQKV(xTensor, qkvTensor, attnOutTensor);
+                             std::memcpy(qkvOut.data(), attnOutTensor.CPUHostData.data(), (hidden * 3) * sizeof(float));
+                         }
+
+                         // Reshape QKV output into Q, K, V per-head
+                         std::vector<float> Q(hidden, 0.0f);
+                         std::vector<float> K(hidden, 0.0f);
+                         std::vector<float> V(hidden, 0.0f);
+                         for (int h = 0; h < nHeads; ++h) {
+                             for (int d = 0; d < headDim; ++d) {
+                                 int outIdx = h * headDim + d;
+                                 Q[outIdx] = qkvOut[outIdx];
+                                 K[outIdx] = qkvOut[hidden + outIdx];
+                                 V[outIdx] = qkvOut[2 * hidden + outIdx];
+                             }
+                         }
+
+                         // CPU FlashAttention or GPU shader dispatch
+                         std::vector<float> attnOut(hidden, 0.0f);
+                         if (layer.PrimaryLocation == DeviceLocation::GPU_VRAM && m_dxEngine) {
+                             DispatchGPUFlashAttention(Q, K, V, attnOut, seqLen, nHeads, headDim);
+                         } else {
+                             ComputeFlashAttentionCPU(Q, K, V, attnOut, seqLen, nHeads, headDim);
+                         }
+
+                         // O projection
+                         if (!layer.O_Proj.CPUHostData.empty()) {
+                             Tensor attnTensor, oTensor, xOutTensor;
+                             attnTensor.Shape = { (size_t)hidden, 1 };
+                             attnTensor.CPUHostData.resize(hidden * sizeof(float));
+                             std::memcpy(attnTensor.CPUHostData.data(), attnOut.data(), hidden * sizeof(float));
+                             attnTensor.Location = DeviceLocation::CPU_SystemRAM;
+                             oTensor = layer.O_Proj;
+
+                             if (layer.PrimaryLocation == DeviceLocation::GPU_VRAM && m_dxEngine && m_gemmPSOReady) {
+                                 DispatchGPUMatrixMultiply(attnTensor, oTensor, xOutTensor);
+                                 std::vector<float> newX(hidden, 0.0f);
+                                 std::memcpy(newX.data(), xOutTensor.CPUHostData.data(), hidden * sizeof(float));
+                                 x = std::move(newX);
+                             } else {
+                                 DispatchCPUMatrixMultiply(attnTensor, oTensor, xOutTensor);
+                                 std::vector<float> newX(hidden, 0.0f);
+                                 std::memcpy(newX.data(), xOutTensor.CPUHostData.data(), hidden * sizeof(float));
+                                 x = std::move(newX);
+                             }
+                         }
+
+                         // KV cache update: store K and V for next-token attention
+                         if (m_dxEngine) {
+                             uint32_t slot = m_kvCache.GetSequenceLength(0);
+                             m_kvCache.WriteTokenKV(m_dxEngine->GetDevice(), m_dxEngine->GetComputeQueue(), m_inferFenceEvent,
+                                 0, slot, K.data(), V.data());
+                         }
+                     } else {
+                         // Identity pass-through when attention weights unavailable
+                     }
 
                     // RMSNorm before FFN
                     if (!layer.FFN_Norm.CPUHostData.empty()) {
@@ -788,12 +1007,76 @@ std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " 
                         for (size_t i = 0; i < hidden; ++i) x[i] = normX[i] * normW[i];
                     }
 
-                    // FFN (Dense): Gate -> SiLU -> Up -> Multiply -> Down
-                    if (m_config.Type == ModelType::Dense && !layer.FFN_Gate_Proj.CPUHostData.empty()) {
-                        // Placeholder - real implementation needs matrix multiply dispatch
-                    }
-                }
-            }
+// FFN (Dense): Gate -> SiLU -> Up -> Multiply -> Down
+                     if (m_config.Type == ModelType::Dense && !layer.FFN_Gate_Proj.CPUHostData.empty() && !layer.FFN_Down_Proj.CPUHostData.empty()) {
+                         int intermediate = (int)m_config.IntermediateDim;
+
+                         // Gate projection + SiLU
+                         Tensor xTensor, gateTensor, gateOutTensor;
+                         xTensor.Shape = { (size_t)hidden, 1 };
+                         xTensor.CPUHostData.resize(hidden * sizeof(float));
+                         std::memcpy(xTensor.CPUHostData.data(), x.data(), hidden * sizeof(float));
+                         xTensor.Location = DeviceLocation::CPU_SystemRAM;
+                         gateTensor = layer.FFN_Gate_Proj;
+
+                         std::vector<float> gateOut(intermediate, 0.0f);
+                         gateOutTensor.Shape = { (size_t)intermediate, 1 };
+                         gateOutTensor.CPUHostData.resize(intermediate * sizeof(float));
+
+                         if (layer.PrimaryLocation == DeviceLocation::GPU_VRAM && m_dxEngine && m_gemmPSOReady) {
+                             DispatchGPUMatrixMultiply(xTensor, gateTensor, gateOutTensor);
+                             std::memcpy(gateOut.data(), gateOutTensor.CPUHostData.data(), intermediate * sizeof(float));
+                         } else {
+                             DispatchCPUMatrixMultiply(xTensor, gateTensor, gateOutTensor);
+                             std::memcpy(gateOut.data(), gateOutTensor.CPUHostData.data(), intermediate * sizeof(float));
+                         }
+
+                         // Apply SiLU: x * sigmoid(x) = x / (1 + exp(-x))
+                         for (int i = 0; i < intermediate; ++i)
+                             gateOut[i] = gateOut[i] / (1.0f + std::exp(-gateOut[i]));
+
+                         // Up projection
+                         std::vector<float> upOut(intermediate, 0.0f);
+                         Tensor upTensor, xUpTensor, upOutTensor;
+                         upTensor = layer.FFN_Up_Proj;
+                         xUpTensor = xTensor;
+                         upOutTensor.Shape = { (size_t)intermediate, 1 };
+                         upOutTensor.CPUHostData.resize(intermediate * sizeof(float));
+
+                         if (layer.PrimaryLocation == DeviceLocation::GPU_VRAM && m_dxEngine && m_gemmPSOReady) {
+                             DispatchGPUMatrixMultiply(xUpTensor, upTensor, upOutTensor);
+                             std::memcpy(upOut.data(), upOutTensor.CPUHostData.data(), intermediate * sizeof(float));
+                         } else {
+                             DispatchCPUMatrixMultiply(xUpTensor, upTensor, upOutTensor);
+                             std::memcpy(upOut.data(), upOutTensor.CPUHostData.data(), intermediate * sizeof(float));
+                         }
+
+                         // Element-wise multiply: gateSiLU .* up
+                         for (int i = 0; i < intermediate; ++i)
+                             gateOut[i] *= upOut[i];
+
+                         // Down projection
+                         Tensor intermTensor, downTensor, finalOutTensor;
+                         intermTensor.Shape = { (size_t)intermediate, 1 };
+                         intermTensor.CPUHostData.resize(intermediate * sizeof(float));
+                         std::memcpy(intermTensor.CPUHostData.data(), gateOut.data(), intermediate * sizeof(float));
+                         intermTensor.Location = DeviceLocation::CPU_SystemRAM;
+                         downTensor = layer.FFN_Down_Proj;
+
+                         if (layer.PrimaryLocation == DeviceLocation::GPU_VRAM && m_dxEngine && m_gemmPSOReady) {
+                             DispatchGPUMatrixMultiply(intermTensor, downTensor, finalOutTensor);
+                             std::vector<float> newX(hidden, 0.0f);
+                             std::memcpy(newX.data(), finalOutTensor.CPUHostData.data(), hidden * sizeof(float));
+                             x = std::move(newX);
+                         } else {
+                             DispatchCPUMatrixMultiply(intermTensor, downTensor, finalOutTensor);
+                             std::vector<float> newX(hidden, 0.0f);
+                             std::memcpy(newX.data(), finalOutTensor.CPUHostData.data(), hidden * sizeof(float));
+                             x = std::move(newX);
+                         }
+                     }
+                 }
+             }
 
             // ----------------------------------------------------------------
             //  GPU path — lm_head is in VRAM
@@ -1038,6 +1321,87 @@ std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " 
                         }
                         for (auto& th : threads) th.join();
                     }
+                } else if (lmHeadTensor->QuantType == QuantizationType::Q4_K) {
+                    const uint8_t* basePtr = lmHeadTensor->CPUHostData.data();
+                    size_t blocksPerCol = (size_t)hidden / 256;
+                    size_t blockBytes = 4 + 12 + 128; // dm + scales + qs
+                    auto worker = [&](int jStart, int jEnd) {
+                        std::vector<float> row(hidden);
+                        for (int j = jStart; j < jEnd; j++) {
+                            const uint8_t* rowPtr = basePtr + (size_t)j * blocksPerCol * blockBytes;
+                            for (int b = 0; b < blocksPerCol; ++b) {
+                                DequantizeQ4_K(rowPtr + b * blockBytes, row.data() + b * 256);
+                            }
+                            outLogits[j] = DotProductSIMD(x.data(), row.data(), hidden);
+                        }
+                    };
+                    if (nThreads == 1) {
+                        worker(0, vocab);
+                    } else {
+                        std::vector<std::thread> threads;
+                        threads.reserve(nThreads);
+                        for (int t = 0; t < nThreads; t++) {
+                            int jStart = t * chunk;
+                            int jEnd   = std::min(jStart + chunk, vocab);
+                            if (jStart < jEnd)
+                                threads.emplace_back(worker, jStart, jEnd);
+                        }
+                        for (auto& th : threads) th.join();
+                    }
+                } else if (lmHeadTensor->QuantType == QuantizationType::Q5_K) {
+                    const uint8_t* basePtr = lmHeadTensor->CPUHostData.data();
+                    size_t blocksPerCol = (size_t)hidden / 256;
+                    size_t blockBytes = 4 + 12 + 32 + 128; // dm + scales + qh + qs
+                    auto worker = [&](int jStart, int jEnd) {
+                        std::vector<float> row(hidden);
+                        for (int j = jStart; j < jEnd; j++) {
+                            const uint8_t* rowPtr = basePtr + (size_t)j * blocksPerCol * blockBytes;
+                            for (int b = 0; b < blocksPerCol; ++b) {
+                                DequantizeQ5_K(rowPtr + b * blockBytes, row.data() + b * 256);
+                            }
+                            outLogits[j] = DotProductSIMD(x.data(), row.data(), hidden);
+                        }
+                    };
+                    if (nThreads == 1) {
+                        worker(0, vocab);
+                    } else {
+                        std::vector<std::thread> threads;
+                        threads.reserve(nThreads);
+                        for (int t = 0; t < nThreads; t++) {
+                            int jStart = t * chunk;
+                            int jEnd   = std::min(jStart + chunk, vocab);
+                            if (jStart < jEnd)
+                                threads.emplace_back(worker, jStart, jEnd);
+                        }
+                        for (auto& th : threads) th.join();
+                    }
+                } else if (lmHeadTensor->QuantType == QuantizationType::Q6_K) {
+                    const uint8_t* basePtr = lmHeadTensor->CPUHostData.data();
+                    size_t blocksPerCol = (size_t)hidden / 256;
+                    size_t blockBytes = 128 + 64 + 16 + 2; // ql + qh + scales + d
+                    auto worker = [&](int jStart, int jEnd) {
+                        std::vector<float> row(hidden);
+                        for (int j = jStart; j < jEnd; j++) {
+                            const uint8_t* rowPtr = basePtr + (size_t)j * blocksPerCol * blockBytes;
+                            for (int b = 0; b < blocksPerCol; ++b) {
+                                DequantizeQ6_K(rowPtr + b * blockBytes, row.data() + b * 256);
+                            }
+                            outLogits[j] = DotProductSIMD(x.data(), row.data(), hidden);
+                        }
+                    };
+                    if (nThreads == 1) {
+                        worker(0, vocab);
+                    } else {
+                        std::vector<std::thread> threads;
+                        threads.reserve(nThreads);
+                        for (int t = 0; t < nThreads; t++) {
+                            int jStart = t * chunk;
+                            int jEnd   = std::min(jStart + chunk, vocab);
+                            if (jStart < jEnd)
+                                threads.emplace_back(worker, jStart, jEnd);
+                        }
+                        for (auto& th : threads) th.join();
+                    }
                 }
 
                 m_cpuDispatchedOperators++;
@@ -1052,15 +1416,17 @@ std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " 
     // ================================================================
     //  Misc
     // ================================================================
-    void ModelPipeline::Reset() {
-        m_weightTensors.clear();
-        m_vramUsageBytes = m_systemRamUsageBytes = 0;
-        m_gemmPSOReady = false;
-        m_persistentHiddenBytes = m_persistentVocabBytes = 0;
-        m_dsLoader.Shutdown();
-        m_kvCache.Reset();
-        m_openVINO.Shutdown();
-    }
+void ModelPipeline::Reset() {
+         m_weightTensors.clear();
+         m_vramUsageBytes = m_systemRamUsageBytes = 0;
+         m_gemmPSOReady = false;
+         m_flashAttnPSO.Reset();
+         m_flashAttnRootSig.Reset();
+         m_persistentHiddenBytes = m_persistentVocabBytes = 0;
+         m_dsLoader.Shutdown();
+         m_kvCache.Reset();
+         m_openVINO.Shutdown();
+     }
 
     bool ModelPipeline::DispatchGPUMatrixMultiply(const Tensor& X, const Tensor& W, Tensor& Y) {
         if (!m_dxEngine || !m_gemmPSOReady) return false;
@@ -1146,18 +1512,26 @@ bool ModelPipeline::DispatchCPUMatrixMultiply(const Tensor& X, const Tensor& W, 
                         }
                     }
                 } else if (W.QuantType == QuantizationType::Q4_K) {
-                    // Q4_K block format: 32 weights per block, variable layout
-                    // For simplicity, treat as raw float (placeholder - needs full implementation)
-                    const float* wPtr = reinterpret_cast<const float*>(W.CPUHostData.data());
-                    for (int k = 0; k < K; k++) wRow[k] = wPtr[j * K + k];
+                    size_t blocksPerRow = K / 256;
+                    size_t blockBytes = 4 + 12 + 128; // dm + scales + qs
+                    const uint8_t* rowPtr = W.CPUHostData.data() + j * blocksPerRow * blockBytes;
+                    for (int b = 0; b < blocksPerRow; b++) {
+                        DequantizeQ4_K(rowPtr + b * blockBytes, wRow.data() + b * 256);
+                    }
                 } else if (W.QuantType == QuantizationType::Q5_K) {
-                    // Q5_K: 5-bit quantization - treat as raw (placeholder)
-                    const float* wPtr = reinterpret_cast<const float*>(W.CPUHostData.data());
-                    for (int k = 0; k < K; k++) wRow[k] = wPtr[j * K + k];
+                    size_t blocksPerRow = K / 256;
+                    size_t blockBytes = 4 + 12 + 32 + 128; // dm + scales + qh + qs
+                    const uint8_t* rowPtr = W.CPUHostData.data() + j * blocksPerRow * blockBytes;
+                    for (int b = 0; b < blocksPerRow; b++) {
+                        DequantizeQ5_K(rowPtr + b * blockBytes, wRow.data() + b * 256);
+                    }
                 } else if (W.QuantType == QuantizationType::Q6_K) {
-                    // Q6_K: 6-bit quantization - treat as raw (placeholder)
-                    const float* wPtr = reinterpret_cast<const float*>(W.CPUHostData.data());
-                    for (int k = 0; k < K; k++) wRow[k] = wPtr[j * K + k];
+                    size_t blocksPerRow = K / 256;
+                    size_t blockBytes = 128 + 64 + 16 + 2; // ql + qh + scales + d
+                    const uint8_t* rowPtr = W.CPUHostData.data() + j * blocksPerRow * blockBytes;
+                    for (int b = 0; b < blocksPerRow; b++) {
+                        DequantizeQ6_K(rowPtr + b * blockBytes, wRow.data() + b * 256);
+                    }
                 } else {
                     // Fallback for Q4_0 and other types - treat as raw
                     const float* wPtr = reinterpret_cast<const float*>(W.CPUHostData.data());
@@ -1212,16 +1586,394 @@ bool ModelPipeline::DispatchCPUMatrixMultiply(const Tensor& X, const Tensor& W, 
         return (float)n / (float)m_layers.size();
     }
 
-    void ModelPipeline::WaitForGPU() {
-        if (m_dxEngine && m_executionFence) {
-            m_fenceValue++;
-            m_dxEngine->GetComputeQueue()->Signal(m_executionFence.Get(), m_fenceValue);
-            if (m_executionFence->GetCompletedValue() < m_fenceValue) {
-                HANDLE ev = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-                m_executionFence->SetEventOnCompletion(m_fenceValue, ev);
-                WaitForSingleObject(ev, INFINITE);
-                CloseHandle(ev);
-            }
-        }
-    }
-}
+void ModelPipeline::WaitForGPU() {
+         if (m_dxEngine && m_executionFence) {
+             m_fenceValue++;
+             m_dxEngine->GetComputeQueue()->Signal(m_executionFence.Get(), m_fenceValue);
+             if (m_executionFence->GetCompletedValue() < m_fenceValue) {
+                 HANDLE ev = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+                 m_executionFence->SetEventOnCompletion(m_fenceValue, ev);
+                 WaitForSingleObject(ev, INFINITE);
+                 CloseHandle(ev);
+             }
+         }
+     }
+
+     // ================================================================
+     //  QKV-specific matrix multiply (for QKV projection output shape handling)
+     // ================================================================
+     bool ModelPipeline::DispatchCPUMatrixMultiplyQKV(const Tensor& X, const Tensor& W, Tensor& Y) {
+         if (W.CPUHostData.empty() || X.CPUHostData.empty()) return false;
+
+         size_t K = X.Shape.empty() ? 1 : X.Shape[0];
+         size_t N = W.Shape.size() >= 2 ? W.Shape[0] : 4096;
+
+         Y.Shape = {N, 1};
+         Y.CPUHostData.resize(N * sizeof(float));
+         float* yOut = reinterpret_cast<float*>(Y.CPUHostData.data());
+
+         int nThreads = std::max(1, m_cpuThreadCount);
+         int chunk = (N + nThreads - 1) / nThreads;
+
+         auto worker = [&](int jStart, int jEnd) {
+             std::vector<float> wRow(K);
+             for (int j = jStart; j < jEnd; j++) {
+                 if (W.QuantType == QuantizationType::None_FP32) {
+                     const float* wPtr = reinterpret_cast<const float*>(W.CPUHostData.data());
+                     for (int k = 0; k < (int)K; k++) wRow[k] = wPtr[j * K + k];
+                 } else if (W.QuantType == QuantizationType::None_FP16) {
+                     const uint16_t* wPtr = reinterpret_cast<const uint16_t*>(W.CPUHostData.data());
+                     for (int k = 0; k < (int)K; k++) wRow[k] = FP16ToFloat(wPtr[j * K + k]);
+                 } else if (W.QuantType == QuantizationType::Q8_0) {
+                     size_t blocksPerRow = K / 32;
+                     const uint8_t* rowPtr = W.CPUHostData.data() + j * blocksPerRow * 34;
+                     for (size_t b = 0; b < blocksPerRow; ++b) {
+                         const uint8_t* blockPtr = rowPtr + b * 34;
+                         uint16_t d_raw;
+                         std::memcpy(&d_raw, blockPtr, 2);
+                         float d = FP16ToFloat(d_raw);
+                         const int8_t* qs = reinterpret_cast<const int8_t*>(blockPtr + 2);
+                         for (size_t k = 0; k < 32; k++) wRow[b * 32 + k] = qs[k] * d;
+                     }
+                 } else if (W.QuantType == QuantizationType::Q4_0) {
+                     size_t blocksPerRow = K / 32;
+                     const uint8_t* rowPtr = W.CPUHostData.data() + j * blocksPerRow * 18;
+                     for (int b = 0; b < (int)blocksPerRow; b++) {
+                         const uint8_t* blockPtr = rowPtr + b * 18;
+                         uint16_t scale_raw;
+                         std::memcpy(&scale_raw, blockPtr, 2);
+                         float scale = FP16ToFloat(scale_raw);
+                         const uint8_t* qs = blockPtr + 2;
+                         for (int k = 0; k < 32; k++) {
+                             uint8_t byte = qs[k / 2];
+                             int8_t nibble = (k % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+                             wRow[b * 32 + k] = (float)nibble * scale;
+                         }
+                     }
+                 } else if (W.QuantType == QuantizationType::Q4_K) {
+                     size_t blocksPerRow = K / 256;
+                     size_t blockBytes = 4 + 12 + 128;
+                     const uint8_t* rowPtr = W.CPUHostData.data() + j * blocksPerRow * blockBytes;
+                     for (int b = 0; b < (int)blocksPerRow; b++) {
+                         DequantizeQ4_K(rowPtr + b * blockBytes, wRow.data() + b * 256);
+                     }
+                 } else if (W.QuantType == QuantizationType::Q5_K) {
+                     size_t blocksPerRow = K / 256;
+                     size_t blockBytes = 4 + 12 + 32 + 128;
+                     const uint8_t* rowPtr = W.CPUHostData.data() + j * blocksPerRow * blockBytes;
+                     for (int b = 0; b < (int)blocksPerRow; b++) {
+                         DequantizeQ5_K(rowPtr + b * blockBytes, wRow.data() + b * 256);
+                     }
+                 } else if (W.QuantType == QuantizationType::Q6_K) {
+                     size_t blocksPerRow = K / 256;
+                     size_t blockBytes = 128 + 64 + 16 + 2;
+                     const uint8_t* rowPtr = W.CPUHostData.data() + j * blocksPerRow * blockBytes;
+                     for (int b = 0; b < (int)blocksPerRow; b++) {
+                         DequantizeQ6_K(rowPtr + b * blockBytes, wRow.data() + b * 256);
+                     }
+                 } else {
+                     const float* wPtr = reinterpret_cast<const float*>(W.CPUHostData.data());
+                     for (int k = 0; k < (int)K; k++) wRow[k] = wPtr[j * K + k];
+                 }
+                 yOut[j] = DotProductSIMD(reinterpret_cast<const float*>(X.CPUHostData.data()), wRow.data(), (int)K);
+             }
+         };
+
+         m_cpuDispatchedOperators++;
+         if (nThreads == 1) {
+             worker(0, (int)N);
+         } else {
+             std::vector<std::thread> threads;
+             for (int t = 0; t < nThreads; t++) {
+                 int jStart = t * chunk;
+                 int jEnd = std::min(jStart + chunk, (int)N);
+                 if (jStart < jEnd) threads.emplace_back(worker, jStart, jEnd);
+             }
+             for (auto& th : threads) th.join();
+         }
+         return true;
+     }
+
+// ================================================================
+     //  FlashAttention CPU (masked, causal, online softmax)
+     // ================================================================
+     void ModelPipeline::ComputeFlashAttentionCPU(const std::vector<float>& Q, const std::vector<float>& K, const std::vector<float>& V,
+                                                  std::vector<float>& out, int seqLen, int nHeads, int headDim) {
+         out.assign((size_t)nHeads * headDim, 0.0f);
+         float invSqrtD = 1.0f / std::sqrt((float)headDim);
+
+         std::vector<float> tempAccum(nHeads * headDim, 0.0f);
+
+         for (int h = 0; h < nHeads; ++h) {
+             int hBase = h * headDim;
+
+             for (int d = 0; d < headDim; ++d)
+                 tempAccum[hBase + d] = 0.0f;
+
+             float runningMax = -1e30f;
+             float runningSum = 0.0f;
+             std::vector<float> maxVals(seqLen, -1e30f);
+             std::vector<float> sumVals(seqLen, 0.0f);
+             std::vector<std::vector<float>> valAcc(seqLen, std::vector<float>(headDim, 0.0f));
+
+             for (int kPos = 0; kPos < seqLen; ++kPos) {
+                 float score = -1e30f;
+                 for (int d = 0; d < headDim; ++d)
+                     score += Q[hBase + d] * K[hBase + d];
+                 score *= invSqrtD;
+                 maxVals[kPos] = score;
+             }
+
+             // Online softmax with proper accumulation order
+             for (int loop = 0; loop < seqLen; ++loop) {
+                 float tileMax = -1e30f;
+                 for (int kPos = 0; kPos < seqLen; ++kPos)
+                     tileMax = std::max(tileMax, maxVals[kPos]);
+                 runningMax = std::max(runningMax, tileMax);
+             }
+
+             float runningZ = 0.0f;
+             for (int kPos = 0; kPos < seqLen; ++kPos) {
+                 float p = std::exp(maxVals[kPos] - runningMax);
+                 runningZ += p;
+                 for (int d = 0; d < headDim; ++d)
+                     valAcc[kPos][d] = p * V[hBase + d];
+             }
+
+             for (int d = 0; d < headDim; ++d) {
+                 float acc = 0.0f;
+                 for (int kPos = 0; kPos < seqLen; ++kPos)
+                     acc += valAcc[kPos][d];
+                 out[hBase + d] = acc / runningZ;
+             }
+         }
+     }
+
+     // ================================================================
+     //  GPU FlashAttention dispatch (using TurboKernels.hlsl FusedFlashAttentionKernel)
+     // ================================================================
+bool ModelPipeline::DispatchGPUFlashAttention(const std::vector<float>& Q, const std::vector<float>& K, const std::vector<float>& V,
+                                                    std::vector<float>& out, int seqLen, int nHeads, int headDim) {
+         if (!m_dxEngine) return false;
+
+         size_t qkvBytes = (size_t)nHeads * headDim * sizeof(float);
+         ComPtr<ID3D12Resource> qBuffer, kBuffer, vBuffer, outBuffer;
+         ComPtr<ID3D12Resource> qUpload, kUpload, vUpload;
+
+         ComPtr<ID3D12Device> dev = m_dxEngine->GetDevice();
+
+D3D12_HEAP_PROPERTIES defProps = {};
+          defProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+          D3D12_HEAP_PROPERTIES upProps = {};
+          upProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+          D3D12_RESOURCE_DESC bufDesc = {};
+          bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+          bufDesc.Width = qkvBytes;
+          bufDesc.Height = 1;
+          bufDesc.DepthOrArraySize = 1;
+          bufDesc.MipLevels = 1;
+          bufDesc.Format = DXGI_FORMAT_UNKNOWN;
+          bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+          bufDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+          // Q, K, V buffers (will be copied to, then used as SRV)
+          dev->CreateCommittedResource(&defProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
+              D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&qBuffer));
+          dev->CreateCommittedResource(&defProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
+              D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&kBuffer));
+          dev->CreateCommittedResource(&defProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
+              D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&vBuffer));
+
+          // Output buffer needs UAV
+          bufDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+          dev->CreateCommittedResource(&defProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
+              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&outBuffer));
+
+          bufDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+          D3D12_RESOURCE_DESC upDesc = {};
+          upDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+          upDesc.Width = qkvBytes;
+          upDesc.Height = 1;
+          upDesc.DepthOrArraySize = 1;
+          upDesc.MipLevels = 1;
+          upDesc.Format = DXGI_FORMAT_UNKNOWN;
+          upDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+          upDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+          dev->CreateCommittedResource(&upProps, D3D12_HEAP_FLAG_NONE, &upDesc,
+              D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&qUpload));
+          dev->CreateCommittedResource(&upProps, D3D12_HEAP_FLAG_NONE, &upDesc,
+              D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&kUpload));
+          dev->CreateCommittedResource(&upProps, D3D12_HEAP_FLAG_NONE, &upDesc,
+              D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&vUpload));
+
+         // Upload data to upload heaps
+         void* p;
+         qUpload->Map(0, nullptr, &p);
+         std::memcpy(p, Q.data(), qkvBytes);
+         qUpload->Unmap(0, nullptr);
+         kUpload->Map(0, nullptr, &p);
+         std::memcpy(p, K.data(), qkvBytes);
+         kUpload->Unmap(0, nullptr);
+         vUpload->Map(0, nullptr, &p);
+         std::memcpy(p, V.data(), qkvBytes);
+         vUpload->Unmap(0, nullptr);
+
+         // Compile FlashAttention shader if needed
+         if (!m_flashAttnPSO) {
+             BuildFlashAttentionPipeline();
+         }
+
+         ComPtr<ID3D12CommandAllocator> alloc;
+         ComPtr<ID3D12GraphicsCommandList> list;
+         dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&alloc));
+         dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, alloc.Get(),
+             m_flashAttnPSO.Get(), IID_PPV_ARGS(&list));
+
+         // Set constants: 4 uints + 1 float = needs 2 vec4 slots
+         struct { uint32_t BatchSize, NumHeads, HeadDim, SeqLen; float InvSqrtD; } attnConsts;
+         attnConsts.BatchSize = 1;
+         attnConsts.NumHeads = (uint32_t)nHeads;
+         attnConsts.HeadDim = (uint32_t)headDim;
+         attnConsts.SeqLen = (uint32_t)seqLen;
+         attnConsts.InvSqrtD = 1.0f / std::sqrt((float)headDim);
+
+         list->SetPipelineState(m_flashAttnPSO.Get());
+         list->SetComputeRootSignature(m_flashAttnRootSig.Get());
+         list->SetComputeRoot32BitConstants(0, 5, &attnConsts, 0);
+         list->SetComputeRootShaderResourceView(1, qBuffer->GetGPUVirtualAddress());
+         list->SetComputeRootShaderResourceView(2, kBuffer->GetGPUVirtualAddress());
+         list->SetComputeRootShaderResourceView(3, vBuffer->GetGPUVirtualAddress());
+         list->SetComputeRootUnorderedAccessView(4, outBuffer->GetGPUVirtualAddress());
+
+         // Copy Q, K, V from upload heaps to default heaps
+         list->CopyBufferRegion(qBuffer.Get(), 0, qUpload.Get(), 0, qkvBytes);
+         list->CopyBufferRegion(kBuffer.Get(), 0, kUpload.Get(), 0, qkvBytes);
+         list->CopyBufferRegion(vBuffer.Get(), 0, vUpload.Get(), 0, qkvBytes);
+
+         // Transition Q, K, V buffers: COPY_DEST -> NON_PIXEL_SHADER_RESOURCE
+         D3D12_RESOURCE_BARRIER toSRV[3] = {};
+         toSRV[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+         toSRV[0].Transition.pResource = qBuffer.Get();
+         toSRV[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+         toSRV[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+         toSRV[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+         toSRV[1].Transition.pResource = kBuffer.Get();
+         toSRV[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+         toSRV[1].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+         toSRV[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+         toSRV[2].Transition.pResource = vBuffer.Get();
+         toSRV[2].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+         toSRV[2].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+         list->ResourceBarrier(3, toSRV);
+
+         list->Dispatch((uint32_t)seqLen, (uint32_t)nHeads, 1);
+         list->Close();
+
+         ID3D12CommandList* ls[] = { list.Get() };
+         m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, ls);
+         m_dxEngine->GetComputeQueue()->Signal(m_inferFence.Get(), ++m_inferFenceValue);
+         WaitFence(m_inferFence.Get(), m_inferFenceValue, m_inferFenceEvent);
+
+// Read back output
+          ComPtr<ID3D12Resource> readback;
+          D3D12_HEAP_PROPERTIES rbProps = {};
+          rbProps.Type = D3D12_HEAP_TYPE_READBACK;
+          D3D12_RESOURCE_DESC rbDesc = {};
+          rbDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+          rbDesc.Width = qkvBytes;
+          rbDesc.Height = 1;
+          rbDesc.DepthOrArraySize = 1;
+          rbDesc.MipLevels = 1;
+          rbDesc.Format = DXGI_FORMAT_UNKNOWN;
+          rbDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+          rbDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+          dev->CreateCommittedResource(&rbProps, D3D12_HEAP_FLAG_NONE, &rbDesc,
+              D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback));
+
+         ComPtr<ID3D12CommandAllocator> alloc2;
+         ComPtr<ID3D12GraphicsCommandList> list2;
+         dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&alloc2));
+         dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, alloc2.Get(), nullptr, IID_PPV_ARGS(&list2));
+
+         D3D12_RESOURCE_BARRIER toCopy = {};
+         toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+         toCopy.Transition.pResource = outBuffer.Get();
+         toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+         toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+         toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+         list2->ResourceBarrier(1, &toCopy);
+         list2->CopyBufferRegion(readback.Get(), 0, outBuffer.Get(), 0, qkvBytes);
+         list2->Close();
+         ID3D12CommandList* ls2[] = { list2.Get() };
+         m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, ls2);
+         m_dxEngine->GetComputeQueue()->Signal(m_inferFence.Get(), ++m_inferFenceValue);
+         WaitFence(m_inferFence.Get(), m_inferFenceValue, m_inferFenceEvent);
+
+         out.resize((size_t)nHeads * headDim);
+         readback->Map(0, nullptr, &p);
+         std::memcpy(out.data(), p, qkvBytes);
+         readback->Unmap(0, nullptr);
+
+         m_gpuDispatchedOperators += 2;
+         return true;
+     }
+
+     // ================================================================
+     //  Build FlashAttention PSO
+     // ================================================================
+     bool ModelPipeline::BuildFlashAttentionPipeline() {
+         if (!m_dxEngine) return false;
+
+         ComPtr<ID3DBlob> shaderBlob;
+         if (!m_dxEngine->CompileComputeShader(L"shaders/TurboKernels.hlsl", "FusedFlashAttentionKernel", &shaderBlob)) {
+             std::cerr << "[ModelPipeline][FlashAttn] Shader compile failed." << std::endl;
+             return false;
+         }
+
+         D3D12_ROOT_PARAMETER rootParams[5] = {};
+         rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+         rootParams[0].Constants.ShaderRegister = 0;
+         rootParams[0].Constants.Num32BitValues = 5; // 4 uints + 1 float
+         rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+         for (int i = 1; i <= 3; i++) {
+             rootParams[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+             rootParams[i].Descriptor.ShaderRegister = (UINT)i;
+             rootParams[i].Descriptor.RegisterSpace = 0;
+             rootParams[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+         }
+
+         rootParams[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+         rootParams[4].Descriptor.ShaderRegister = 0;
+         rootParams[4].Descriptor.RegisterSpace = 0;
+         rootParams[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+         D3D12_ROOT_SIGNATURE_DESC rsDesc = {};
+         rsDesc.NumParameters = 5;
+         rsDesc.pParameters = rootParams;
+         rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+         ComPtr<ID3DBlob> sig, err;
+         HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+         if (FAILED(hr)) {
+             std::cerr << "[ModelPipeline][FlashAttn] Root sig error: " << (err ? (char*)err->GetBufferPointer() : "unknown") << std::endl;
+             return false;
+         }
+
+         if (FAILED(m_dxEngine->GetDevice()->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&m_flashAttnRootSig)))) {
+             return false;
+         }
+
+         ComPtr<ID3D12PipelineState> pso;
+         if (!m_dxEngine->CreateComputePipelineState(shaderBlob.Get(), m_flashAttnRootSig.Get(), &pso)) {
+             return false;
+         }
+         m_flashAttnPSO = pso;
+
+         std::cout << "[ModelPipeline][FlashAttn] PSO compiled." << std::endl;
+         return true;
+     }
+ }

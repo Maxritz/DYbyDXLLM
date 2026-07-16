@@ -180,7 +180,7 @@ namespace DirectLLM {
         bool DispatchCPUMatrixMultiply(const Tensor& X, const Tensor& W, Tensor& Y);
         bool DispatchMoERouting(const Tensor& X, const TransformerLayer& layer, std::vector<float>& expertWeights, std::vector<std::vector<uint32_t>>& expertTokens);
         
-        ComPtr<ID3D12CommandAllocator> m_cmdAllocator;
+ComPtr<ID3D12CommandAllocator> m_cmdAllocator;
         ComPtr<ID3D12GraphicsCommandList> m_cmdList;
         ComPtr<ID3D12Fence> m_executionFence;
         UINT64 m_fenceValue = 0;
@@ -188,6 +188,9 @@ namespace DirectLLM {
         ComPtr<ID3D12RootSignature> m_gemmRootSignature;
         ComPtr<ID3D12PipelineState> m_gemmPSO;
         bool m_gemmPSOReady = false;
+
+        ComPtr<ID3D12RootSignature> m_flashAttnRootSig;
+        ComPtr<ID3D12PipelineState> m_flashAttnPSO;
 
         ComPtr<ID3D12Resource> m_xUploadBuffer;
         ComPtr<ID3D12Resource> m_xGPUBuffer;
@@ -203,10 +206,17 @@ namespace DirectLLM {
         HANDLE m_inferFenceEvent = nullptr;
 
         bool BuildGEMMPipeline();
+        bool BuildFlashAttentionPipeline();
         bool EnsurePersistentBuffers(size_t hiddenBytes, size_t vocabBytes);
 
         float DotProductSIMD(const float* a, const float* b, int n) const;
 
         void WaitForGPU();
+
+        bool DispatchCPUMatrixMultiplyQKV(const Tensor& X, const Tensor& W, Tensor& Y);
+        void ComputeFlashAttentionCPU(const std::vector<float>& Q, const std::vector<float>& K, const std::vector<float>& V,
+                                        std::vector<float>& out, int seqLen, int nHeads, int headDim);
+        bool DispatchGPUFlashAttention(const std::vector<float>& Q, const std::vector<float>& K, const std::vector<float>& V,
+                                        std::vector<float>& out, int seqLen, int nHeads, int headDim);
     };
 }
