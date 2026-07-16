@@ -97,13 +97,20 @@ namespace DirectLLM {
         size_t LayerIndex;
         DeviceLocation PrimaryLocation;
         
-        Tensor QKV_Proj;
-        Tensor O_Proj;
-
+        // Attention weights
+        Tensor QKV_Proj;  // QKV combined projection
+        Tensor O_Proj;    // Output projection
+        
+        // RMSNorm weights
+        Tensor Attn_Norm;    // Attention layer norm
+        Tensor FFN_Norm;    // FFN layer norm
+        
+        // FFN weights (for non-MoE models)
         Tensor FFN_Gate_Proj;
         Tensor FFN_Up_Proj;
         Tensor FFN_Down_Proj;
-
+        
+        // MoE weights
         Tensor MoE_Gate;
         std::vector<Tensor> Experts;
         std::vector<DeviceLocation> ExpertLocations;

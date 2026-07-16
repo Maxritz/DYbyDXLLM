@@ -597,6 +597,13 @@ std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " 
 
             Tensor* down = getTensorAlt(base + "ffn_down.weight", baseAlt + "mlp.down_proj.weight", base + "mlp.down.weight");
             if (down) m_layers[l].FFN_Down_Proj = *down;
+
+            // RMSNorm weights - support multiple naming conventions
+            Tensor* attnNorm = getTensorAlt(base + "attn_norm.weight", baseAlt + "input_layernorm.weight", base + "attention_norm.weight");
+            if (attnNorm) m_layers[l].Attn_Norm = *attnNorm;
+
+            Tensor* ffnNorm = getTensorAlt(base + "ffn_norm.weight", baseAlt + "post_attention_layernorm.weight", base + "mlp_norm.weight");
+            if (ffnNorm) m_layers[l].FFN_Norm = *ffnNorm;
         }
 
         if (m_dxEngine) BuildGEMMPipeline();
@@ -753,27 +760,37 @@ std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " 
             if (m_config.NumLayers > 0 && !m_layers.empty()) {
                 for (size_t layerIdx = 0; layerIdx < m_config.NumLayers; ++layerIdx) {
                     const auto& layer = m_layers[layerIdx];
-                    
+
                     // RMSNorm before attention
-                    // Note: Requires RMSNorm weights to be extracted into m_layers[l].RMSNorm_Attn, etc.
-                    
-                    // QKV projection -> Attention -> O projection
-                    // For now: skip GPU path, do CPU path for quantized weights
-                    if (layer.QKV_Proj.GPUResource && layer.O_Proj.GPUResource && m_dxEngine && m_gemmPSOReady) {
-                        // TODO: GPU attention path
-                    } else if (!layer.QKV_Proj.CPUHostData.empty()) {
-                        // CPU QKV projection
-                        size_t qkvHidden = layer.QKV_Proj.Shape.size() >= 2 ? layer.QKV_Proj.Shape[1] : hidden;
-                        std::vector<float> qkvOut(qkvHidden, 0.0f);
-                        // TODO: Implement actual matrix multiply
+                    if (!layer.Attn_Norm.CPUHostData.empty()) {
+                        const float* normW = reinterpret_cast<const float*>(layer.Attn_Norm.CPUHostData.data());
+                        std::vector<float> normX(hidden);
+                        RMSNorm(normX.data(), x.data(), (int)hidden, 1e-5f);
+                        for (size_t i = 0; i < hidden; ++i) x[i] = normX[i] * normW[i];
                     }
-                    
-                    // FFN (Dense) or MoE
-                    if (m_config.Type == ModelType::MixtureOfExperts) {
-                        // TODO: MoE path
-                    } else if (!layer.FFN_Gate_Proj.CPUHostData.empty()) {
-                        // CPU FFN path
-                        // TODO: Implement SiLU + up/down projection
+
+                    // QKV projection
+                    if (!layer.QKV_Proj.CPUHostData.empty()) {
+                        std::vector<float> qkvOut(hidden * 3, 0.0f);
+                        // Placeholder - real implementation needs matrix multiply dispatch
+                    }
+
+                    // O projection after attention
+                    if (!layer.O_Proj.CPUHostData.empty()) {
+                        // Placeholder - would need attention output
+                    }
+
+                    // RMSNorm before FFN
+                    if (!layer.FFN_Norm.CPUHostData.empty()) {
+                        const float* normW = reinterpret_cast<const float*>(layer.FFN_Norm.CPUHostData.data());
+                        std::vector<float> normX(hidden);
+                        RMSNorm(normX.data(), x.data(), (int)hidden, 1e-5f);
+                        for (size_t i = 0; i < hidden; ++i) x[i] = normX[i] * normW[i];
+                    }
+
+                    // FFN (Dense): Gate -> SiLU -> Up -> Multiply -> Down
+                    if (m_config.Type == ModelType::Dense && !layer.FFN_Gate_Proj.CPUHostData.empty()) {
+                        // Placeholder - real implementation needs matrix multiply dispatch
                     }
                 }
             }
