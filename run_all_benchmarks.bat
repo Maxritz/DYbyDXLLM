@@ -6,10 +6,10 @@ rem  generated 200‑word essay to a separate .txt file.
 rem -----------------------------------------------------------------
 
 :: -----------------------------------------------------------------
-::  Paths – models are in C:\Users\rina0423\Desktop\DX\
+::  Paths – models are in (parent)\models\ or (parent)\
 :: -----------------------------------------------------------------
 set "DYBYDX_EXE=%~dp0build\bin\Release\DybyDx.exe"
-set "MODEL_DIR=C:\Users\rina0423\Desktop\DX"
+set "MODEL_DIR=%~dp0.."
 set "MINICPM_MODEL=%MODEL_DIR%\MiniCPM-V-4_6-Q8_0.gguf"
 set "GEMMA_MODEL=%MODEL_DIR%\gemma-4-E4B-it-Q4_K_M.gguf"
 set "PHI3_MODEL=%MODEL_DIR%\Phi-3-mini-4k-instruct-q4.gguf"
