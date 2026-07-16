@@ -64,21 +64,36 @@ namespace DirectLLM {
         if (!m_dxEngine->CompileComputeShader(shaderPath, "TurboQuantDequantKernel", &tqBlob)) return false;
 
         // 1. FLASH ATTENTION PIPELINE
+        // NOTE: this root signature must stay in sync with shaders/TurboKernels.hlsl's
+        // FusedFlashAttentionKernel register declarations (see also
+        // ModelPipeline::BuildFlashAttentionPipeline, which is the copy actually used
+        // during real inference - this one is a separate, currently-unused pipeline that
+        // was left stale after the kernel's registers changed, silently failing to build
+        // and falling back rather than crashing, but still worth keeping correct).
         {
             D3D12_ROOT_PARAMETER rootParams[5] = {};
-            // CBV (attnConfig)
+            // 32-bit constants (attnConfig) - AttentionConstants is now 10 x uint32
             rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
             rootParams[0].Constants.ShaderRegister = 0;
-            rootParams[0].Constants.Num32BitValues = 5;
+            rootParams[0].Constants.Num32BitValues = 10;
             rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-            // SRVs (QueryBuffer, KeyBuffer, ValueBuffer)
-            for (int i = 1; i <= 3; i++) {
-                rootParams[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-                rootParams[i].Descriptor.ShaderRegister = (UINT)(i - 1);
-                rootParams[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-            }
-            // UAV (AttnOutput)
+            // SRV (QueryBuffer only - t0)
+            rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rootParams[1].Descriptor.ShaderRegister = 0;
+            rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // UAV (KeyBuffer - u1)
+            rootParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rootParams[2].Descriptor.ShaderRegister = 1;
+            rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // UAV (ValueBuffer - u2)
+            rootParams[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rootParams[3].Descriptor.ShaderRegister = 2;
+            rootParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // UAV (AttnOutput - u0)
             rootParams[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
             rootParams[4].Descriptor.ShaderRegister = 0;
             rootParams[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;

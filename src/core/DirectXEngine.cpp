@@ -20,13 +20,41 @@ namespace DirectLLM {
         LogTrace("DirectXEngine", "Initializing DirectX 12 via Agility SDK...");
 
         UINT dxgiFactoryFlags = 0;
-#ifdef _DEBUG
-        ComPtr<ID3D12Debug> dbg;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) {
-            dbg->EnableDebugLayer();
-            LogTrace("DirectXEngine", "D3D12 Debug Layer enabled.");
+        // Previously this was gated behind #ifdef _DEBUG, which silently did nothing in
+        // Release builds - setting $env:D3D12_DEBUG=1 had no effect at all, since no code
+        // ever read that variable. That meant a bad resource binding or root signature
+        // mismatch skipped validation entirely and only surfaced as a raw, undiagnosable
+        // access violation deep in D3D12Core.dll instead of a clear D3D12 validation
+        // message naming the actual call and resource at fault.
+        bool wantDebugLayer = false;
+        {
+            char buf[8] = {};
+            size_t len = 0;
+            if (getenv_s(&len, buf, sizeof(buf), "D3D12_DEBUG") == 0 && len > 0) {
+                wantDebugLayer = (buf[0] != '0');
+            }
         }
+#ifdef _DEBUG
+        wantDebugLayer = true; // always on for debug builds regardless of env var
 #endif
+        if (wantDebugLayer) {
+            ComPtr<ID3D12Debug> dbg;
+            if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) {
+                dbg->EnableDebugLayer();
+                LogTrace("DirectXEngine", "D3D12 Debug Layer enabled.");
+
+                // GPU-based validation catches invalid resource states/bindings that
+                // object-level validation alone can miss (exactly the class of bug that
+                // produces a bare access violation instead of a clean error message).
+                ComPtr<ID3D12Debug1> dbg1;
+                if (SUCCEEDED(dbg.As(&dbg1))) {
+                    dbg1->SetEnableGPUBasedValidation(TRUE);
+                    LogTrace("DirectXEngine", "D3D12 GPU-Based Validation enabled.");
+                }
+            } else {
+                LogTrace("DirectXEngine", "D3D12_DEBUG requested but debug interface unavailable (Graphics Tools optional feature not installed?).");
+            }
+        }
 
         if (FAILED(CreateDXGIFactory2(dxgiFactoryFlags, IID_PPV_ARGS(&m_dxgiFactory)))) {
             LogTrace("DirectXEngine", "CRITICAL: Failed to create DXGI Factory.");
@@ -59,6 +87,34 @@ namespace DirectLLM {
         // QueryDeviceCapabilities needs the device — create device first
         HRESULT hr = D3D12CreateDevice(m_adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&m_device));
         if (FAILED(hr)) { LogTrace("DirectXEngine", "CRITICAL: D3D12CreateDevice failed."); return false; }
+
+        if (wantDebugLayer) {
+            // Print debug layer messages straight to stderr instead of requiring a
+            // debugger attached or DebugView to see them via OutputDebugString.
+            ComPtr<ID3D12InfoQueue> infoQueue;
+            if (SUCCEEDED(m_device.As(&infoQueue))) {
+                infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE);
+                infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, TRUE);
+
+                ComPtr<ID3D12InfoQueue1> infoQueue1;
+                if (SUCCEEDED(infoQueue.As(&infoQueue1))) {
+                    DWORD cookie = 0;
+                    infoQueue1->RegisterMessageCallback(
+                        [](D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity,
+                           D3D12_MESSAGE_ID, LPCSTR pDescription, void*) {
+                            if (severity <= D3D12_MESSAGE_SEVERITY_WARNING) {
+                                std::cerr << "[D3D12" << (severity == D3D12_MESSAGE_SEVERITY_CORRUPTION ? "-CORRUPTION" :
+                                              severity == D3D12_MESSAGE_SEVERITY_ERROR ? "-ERROR" : "-WARN")
+                                          << "] " << pDescription << std::endl;
+                            }
+                        },
+                        D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie);
+                    LogTrace("DirectXEngine", "D3D12 InfoQueue message callback registered.");
+                } else {
+                    LogTrace("DirectXEngine", "ID3D12InfoQueue1 unavailable (older Agility SDK?) - debug messages will only reach a debugger/DebugView, not this console.");
+                }
+            }
+        }
 
         // Now query capabilities (needs device for feature checks)
         QueryDeviceCapabilities();

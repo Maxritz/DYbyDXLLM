@@ -215,8 +215,8 @@ ComPtr<ID3D12CommandAllocator> m_cmdAllocator;
 
         bool DispatchCPUMatrixMultiplyQKV(const Tensor& X, const Tensor& W, Tensor& Y);
         void ComputeFlashAttentionCPU(const std::vector<float>& Q, const std::vector<float>& K, const std::vector<float>& V,
-                                        std::vector<float>& out, int seqLen, int nHeads, int headDim);
+                                        std::vector<float>& out, int seqLen, int nHeads, int headDim, uint32_t layerIdx);
         bool DispatchGPUFlashAttention(const std::vector<float>& Q, const std::vector<float>& K, const std::vector<float>& V,
-                                        std::vector<float>& out, int seqLen, int nHeads, int headDim);
+                                        std::vector<float>& out, int seqLen, int nHeads, int headDim, uint32_t layerIdx);
     };
 }

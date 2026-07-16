@@ -205,6 +205,7 @@ namespace DirectLLM {
             KVCacheConfig kvConfig;
             kvConfig.MaxSequenceLength = 2048;
             kvConfig.BatchSize = 1;
+            kvConfig.NumLayers = (uint32_t)m_config.NumLayers;
             kvConfig.NumHeads = (uint32_t)m_config.NumHeads;
             kvConfig.HeadDimension = (uint32_t)m_config.HeadDim;
             kvConfig.QuantType = m_config.CacheQuantType;
@@ -411,6 +412,7 @@ namespace DirectLLM {
             KVCacheConfig kvConfig;
             kvConfig.MaxSequenceLength = 2048;
             kvConfig.BatchSize = 1;
+            kvConfig.NumLayers = (uint32_t)m_config.NumLayers;
             kvConfig.NumHeads = (uint32_t)m_config.NumHeads;
             kvConfig.HeadDimension = (uint32_t)m_config.HeadDim;
             kvConfig.QuantType = m_config.CacheQuantType;
@@ -959,12 +961,27 @@ std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " 
                              }
                          }
 
+                         // KV cache update: store this token's K/V BEFORE attention runs,
+                         // so the current token's own slot is populated when it attends to
+                         // itself (position seqLen-1). Writing after the dispatch (as before)
+                         // meant every token read an uninitialised slot for its own position.
+                         // layerIdx routes this write to this layer's own region of the cache
+                         // (see KVCacheManager's layer-major layout) - each layer now has an
+                         // independent K/V history instead of all layers sharing one slot.
+                         // The sequence counter itself advances exactly once per TOKEN, after
+                         // the layer loop closes below, not here.
+                         if (m_dxEngine) {
+                             uint32_t slot = m_kvCache.GetSequenceLength(0);
+                             m_kvCache.WriteTokenKV(m_dxEngine->GetDevice(), m_dxEngine->GetComputeQueue(), m_inferFenceEvent,
+                                 0, (uint32_t)layerIdx, slot, K.data(), V.data());
+                         }
+
                          // CPU FlashAttention or GPU shader dispatch
                          std::vector<float> attnOut(hidden, 0.0f);
                          if (layer.PrimaryLocation == DeviceLocation::GPU_VRAM && m_dxEngine) {
-                             DispatchGPUFlashAttention(Q, K, V, attnOut, seqLen, nHeads, headDim);
+                             DispatchGPUFlashAttention(Q, K, V, attnOut, seqLen, nHeads, headDim, (uint32_t)layerIdx);
                          } else {
-                             ComputeFlashAttentionCPU(Q, K, V, attnOut, seqLen, nHeads, headDim);
+                             ComputeFlashAttentionCPU(Q, K, V, attnOut, seqLen, nHeads, headDim, (uint32_t)layerIdx);
                          }
 
                          // O projection
@@ -989,12 +1006,6 @@ std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " 
                              }
                          }
 
-                         // KV cache update: store K and V for next-token attention
-                         if (m_dxEngine) {
-                             uint32_t slot = m_kvCache.GetSequenceLength(0);
-                             m_kvCache.WriteTokenKV(m_dxEngine->GetDevice(), m_dxEngine->GetComputeQueue(), m_inferFenceEvent,
-                                 0, slot, K.data(), V.data());
-                         }
                      } else {
                          // Identity pass-through when attention weights unavailable
                      }
@@ -1077,6 +1088,14 @@ std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " 
                      }
                  }
              }
+
+            // Advance the KV cache sequence counter exactly once per token, now that
+            // every layer has written its own K/V for this position (each into its own
+            // layer region - see WriteTokenKV's layerIdx parameter above). This must NOT
+            // live inside the layerIdx loop above, or it would advance once per layer.
+            if (m_dxEngine) {
+                m_kvCache.AllocateTokens(0, 1);
+            }
 
             // ----------------------------------------------------------------
             //  GPU path — lm_head is in VRAM
@@ -1191,10 +1210,13 @@ std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " 
                 std::memcpy(outLogits.data(), pData, vocabBytes);
                 m_yReadbackBuffer->Unmap(0, nullptr);
 
-                // Write current token KV state to GPU KV buffer (quant-aware CPU->GPU upload)
-                uint32_t slot = m_kvCache.AllocateTokens(0, 1);
-                m_kvCache.WriteTokenKV(m_dxEngine->GetDevice(), m_dxEngine->GetComputeQueue(), m_inferFenceEvent,
-                    0, slot, x.data(), x.data());
+                // NOTE: previously wrote x/x (the final hidden state) into the KV cache
+                // here and re-advanced the sequence counter a second time. That clobbered
+                // every layer's real per-layer K/V (all layers share one m_kvCache instance
+                // indexed by layerIdx; this call used no layerIdx, so its slot write landed
+                // on top of whichever layer's region the (batch,0,seqPos) offset happened to
+                // alias) and double-counted the sequence length on top of the correct
+                // once-per-token advance now done right after the layer loop above. Removed.
 
                 m_gpuDispatchedOperators++;
                 return true;
@@ -1302,7 +1324,7 @@ std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " 
                                 for (int i = 0; i < 32; ++i) {
                                     uint8_t byte = qs[i / 2];
                                     int8_t nibble = (i % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
-                                    row[b * 32 + i] = (float)nibble * scale;
+                                    row[b * 32 + i] = ((float)nibble - 8.0f) * scale;
                                 }
                             }
                             outLogits[j] = DotProductSIMD(x.data(), row.data(), hidden);
@@ -1508,7 +1530,7 @@ bool ModelPipeline::DispatchCPUMatrixMultiply(const Tensor& X, const Tensor& W, 
                         for (int k = 0; k < 32; k++) {
                             uint8_t byte = qs[k / 2];
                             int8_t nibble = (k % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
-                            wRow[b * 32 + k] = (float)nibble * scale;
+                            wRow[b * 32 + k] = ((float)nibble - 8.0f) * scale;
                         }
                     }
                 } else if (W.QuantType == QuantizationType::Q4_K) {
@@ -1647,7 +1669,7 @@ void ModelPipeline::WaitForGPU() {
                          for (int k = 0; k < 32; k++) {
                              uint8_t byte = qs[k / 2];
                              int8_t nibble = (k % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
-                             wRow[b * 32 + k] = (float)nibble * scale;
+                             wRow[b * 32 + k] = ((float)nibble - 8.0f) * scale;
                          }
                      }
                  } else if (W.QuantType == QuantizationType::Q4_K) {
@@ -1697,55 +1719,165 @@ void ModelPipeline::WaitForGPU() {
 // ================================================================
      //  FlashAttention CPU (masked, causal, online softmax)
      // ================================================================
+     // Dequantise one head-slot from a raw byte cache readback, matching
+     // KVCacheManager::QuantizeVector's encode exactly. dst must hold headDim floats.
+     static void DequantHeadSlotCPU(const uint8_t* slot, uint32_t headDim,
+                                     KVCacheQuantType qt, float* dst) {
+         switch (qt) {
+             case KVCacheQuantType::None_FP32: {
+                 std::memcpy(dst, slot, headDim * sizeof(float));
+                 break;
+             }
+             case KVCacheQuantType::None_FP16: {
+                 const uint16_t* h = reinterpret_cast<const uint16_t*>(slot);
+                 for (uint32_t d = 0; d < headDim; ++d) dst[d] = FP16ToFloat(h[d]);
+                 break;
+             }
+             case KVCacheQuantType::FP8: {
+                 for (uint32_t d = 0; d < headDim; ++d) {
+                     float scaled = (float)slot[d] / 127.5f - 1.0f;
+                     dst[d] = scaled * 448.0f;
+                 }
+                 break;
+             }
+             case KVCacheQuantType::INT8: {
+                 float scale; std::memcpy(&scale, slot, sizeof(float));
+                 const int8_t* q = reinterpret_cast<const int8_t*>(slot + sizeof(float));
+                 for (uint32_t d = 0; d < headDim; ++d) dst[d] = (float)q[d] * scale;
+                 break;
+             }
+             case KVCacheQuantType::INT4: {
+                 float scale; std::memcpy(&scale, slot, sizeof(float));
+                 const uint8_t* q = slot + sizeof(float);
+                 for (uint32_t d = 0; d < headDim; ++d) {
+                     uint8_t byte = q[d / 2];
+                     uint8_t nibble = (d % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+                     dst[d] = ((float)nibble - 8.0f) * scale;
+                 }
+                 break;
+             }
+             default:
+                 std::memset(dst, 0, headDim * sizeof(float));
+                 break;
+         }
+     }
+
+     // CPU fallback FlashAttention. Reads the actual cached K/V history back from GPU
+     // (the cache is always GPU-resident regardless of which path handles matmuls),
+     // dequantises per head-slot, and computes real causal attention over it.
+     // Q/K/V parameters: Q is the current token's query; K/V are the current token's
+     // own key/value (already written into m_kvCache by the caller before this runs).
      void ModelPipeline::ComputeFlashAttentionCPU(const std::vector<float>& Q, const std::vector<float>& K, const std::vector<float>& V,
-                                                  std::vector<float>& out, int seqLen, int nHeads, int headDim) {
+                                                  std::vector<float>& out, int seqLen, int nHeads, int headDim, uint32_t layerIdx) {
          out.assign((size_t)nHeads * headDim, 0.0f);
          float invSqrtD = 1.0f / std::sqrt((float)headDim);
 
-         std::vector<float> tempAccum(nHeads * headDim, 0.0f);
+if (!m_dxEngine || seqLen <= 0) { (void)K; (void)V; return; }
+
+          ComPtr<ID3D12Fence> attnLocalFence;
+          uint64_t attnLocalFenceValue = 0;
+          HANDLE attnLocalEvent = nullptr;
+          if (FAILED(m_dxEngine->GetDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&attnLocalFence)))) return;
+          attnLocalEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+          if (!attnLocalEvent) return;
+
+          const auto& cfg = m_kvCache.GetConfig();
+         size_t headStride = m_kvCache.GetHeadStrideBytes();
+         size_t perHeadBufBytes = (size_t)cfg.MaxSequenceLength * headStride;
+         // Layer-major then head-major: this layer's region starts at layerIdx*NumHeads heads in.
+         size_t layerHeadBase = (size_t)layerIdx * cfg.NumHeads;
+
+         // Read back only the [0, seqLen) prefix actually in use, per head, for K and V.
+         auto readbackHead = [&](ID3D12Resource* gpuBuf, uint32_t h, std::vector<uint8_t>& dst) -> bool {
+             size_t readBytes = (size_t)seqLen * headStride;
+             size_t headBase  = (layerHeadBase + h) * perHeadBufBytes; // batchIdx=0
+             dst.resize(readBytes);
+
+             D3D12_HEAP_PROPERTIES rbProps = {}; rbProps.Type = D3D12_HEAP_TYPE_READBACK;
+             D3D12_RESOURCE_DESC rbDesc = {};
+             rbDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+             rbDesc.Width = readBytes; rbDesc.Height = 1; rbDesc.DepthOrArraySize = 1;
+             rbDesc.MipLevels = 1; rbDesc.Format = DXGI_FORMAT_UNKNOWN;
+             rbDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; rbDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+             ComPtr<ID3D12Resource> readback;
+             if (FAILED(m_dxEngine->GetDevice()->CreateCommittedResource(&rbProps, D3D12_HEAP_FLAG_NONE, &rbDesc,
+                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)))) return false;
+
+             ComPtr<ID3D12CommandAllocator> alloc;
+             ComPtr<ID3D12GraphicsCommandList> list;
+             m_dxEngine->GetDevice()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&alloc));
+             m_dxEngine->GetDevice()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, alloc.Get(), nullptr, IID_PPV_ARGS(&list));
+
+             // gpuBuf is UAV-resident (WriteTokenKV always leaves it that way); must
+             // transition UAV -> COPY_SOURCE before reading, then back to UAV afterward
+             // so the next WriteTokenKV call (which expects UAV state) still works.
+             D3D12_RESOURCE_BARRIER toCS = {};
+             toCS.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+             toCS.Transition.pResource   = gpuBuf;
+             toCS.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+             toCS.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+             toCS.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+             list->ResourceBarrier(1, &toCS);
+
+             list->CopyBufferRegion(readback.Get(), 0, gpuBuf, headBase, readBytes);
+
+             D3D12_RESOURCE_BARRIER toUAV = {};
+             toUAV.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+             toUAV.Transition.pResource   = gpuBuf;
+             toUAV.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+             toUAV.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+             toUAV.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+             list->ResourceBarrier(1, &toUAV);
+
+list->Close();
+              ID3D12CommandList* ls[] = { list.Get() };
+              m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, ls);
+              m_dxEngine->GetComputeQueue()->Signal(attnLocalFence.Get(), ++attnLocalFenceValue);
+              WaitFence(attnLocalFence.Get(), attnLocalFenceValue, attnLocalEvent);
+
+             void* p = nullptr;
+             readback->Map(0, nullptr, &p);
+             std::memcpy(dst.data(), p, readBytes);
+             readback->Unmap(0, nullptr);
+             return true;
+         };
+
+         std::vector<float> kVec(headDim), vVec(headDim), scores((size_t)seqLen);
+         std::vector<uint8_t> kRaw, vRaw;
 
          for (int h = 0; h < nHeads; ++h) {
              int hBase = h * headDim;
+             if (!readbackHead(m_kvCache.GetKeyBuffer(),   (uint32_t)h, kRaw)) continue;
+             if (!readbackHead(m_kvCache.GetValueBuffer(), (uint32_t)h, vRaw)) continue;
 
-             for (int d = 0; d < headDim; ++d)
-                 tempAccum[hBase + d] = 0.0f;
-
+             // ---- scores over real per-position K (no causal mask needed: seqLen only
+             // ever contains this token and strictly earlier ones) ----
              float runningMax = -1e30f;
-             float runningSum = 0.0f;
-             std::vector<float> maxVals(seqLen, -1e30f);
-             std::vector<float> sumVals(seqLen, 0.0f);
-             std::vector<std::vector<float>> valAcc(seqLen, std::vector<float>(headDim, 0.0f));
-
              for (int kPos = 0; kPos < seqLen; ++kPos) {
-                 float score = -1e30f;
+                 DequantHeadSlotCPU(kRaw.data() + (size_t)kPos * headStride, (uint32_t)headDim, cfg.QuantType, kVec.data());
+                 float score = 0.0f; // was incorrectly initialised to -1e30f, swallowing the real dot product
                  for (int d = 0; d < headDim; ++d)
-                     score += Q[hBase + d] * K[hBase + d];
+                     score += Q[hBase + d] * kVec[d];
                  score *= invSqrtD;
-                 maxVals[kPos] = score;
+                 scores[kPos] = score;
+                 runningMax = std::max(runningMax, score);
              }
 
-             // Online softmax with proper accumulation order
-             for (int loop = 0; loop < seqLen; ++loop) {
-                 float tileMax = -1e30f;
-                 for (int kPos = 0; kPos < seqLen; ++kPos)
-                     tileMax = std::max(tileMax, maxVals[kPos]);
-                 runningMax = std::max(runningMax, tileMax);
-             }
-
+             // ---- softmax + weighted V accumulation over real per-position V ----
              float runningZ = 0.0f;
+             std::vector<float> acc(headDim, 0.0f);
              for (int kPos = 0; kPos < seqLen; ++kPos) {
-                 float p = std::exp(maxVals[kPos] - runningMax);
+                 float p = std::exp(scores[kPos] - runningMax);
                  runningZ += p;
+                 DequantHeadSlotCPU(vRaw.data() + (size_t)kPos * headStride, (uint32_t)headDim, cfg.QuantType, vVec.data());
                  for (int d = 0; d < headDim; ++d)
-                     valAcc[kPos][d] = p * V[hBase + d];
+                     acc[d] += p * vVec[d];
              }
 
-             for (int d = 0; d < headDim; ++d) {
-                 float acc = 0.0f;
-                 for (int kPos = 0; kPos < seqLen; ++kPos)
-                     acc += valAcc[kPos][d];
-                 out[hBase + d] = acc / runningZ;
-             }
+             float invZ = (runningZ > 0.0f) ? (1.0f / runningZ) : 0.0f;
+             for (int d = 0; d < headDim; ++d)
+                 out[hBase + d] = acc[d] * invZ;
          }
      }
 
@@ -1753,71 +1885,62 @@ void ModelPipeline::WaitForGPU() {
      //  GPU FlashAttention dispatch (using TurboKernels.hlsl FusedFlashAttentionKernel)
      // ================================================================
 bool ModelPipeline::DispatchGPUFlashAttention(const std::vector<float>& Q, const std::vector<float>& K, const std::vector<float>& V,
-                                                    std::vector<float>& out, int seqLen, int nHeads, int headDim) {
+                                                    std::vector<float>& out, int seqLen, int nHeads, int headDim, uint32_t layerIdx) {
          if (!m_dxEngine) return false;
+         // K and V here are the CURRENT token's freshly computed vectors. The caller must
+         // have already written them into m_kvCache (WriteTokenKV) BEFORE calling this, so
+         // that seqLen (the cache's current fill length) includes this token's own slot.
+         // Historical K/V come from m_kvCache directly; K/V parameters are otherwise unused.
+         (void)K; (void)V;
 
-         size_t qkvBytes = (size_t)nHeads * headDim * sizeof(float);
-         ComPtr<ID3D12Resource> qBuffer, kBuffer, vBuffer, outBuffer;
-         ComPtr<ID3D12Resource> qUpload, kUpload, vUpload;
+         size_t qBytes = (size_t)nHeads * headDim * sizeof(float);
+         ComPtr<ID3D12Resource> qBuffer, outBuffer;
+         ComPtr<ID3D12Resource> qUpload;
 
          ComPtr<ID3D12Device> dev = m_dxEngine->GetDevice();
 
-D3D12_HEAP_PROPERTIES defProps = {};
-          defProps.Type = D3D12_HEAP_TYPE_DEFAULT;
-          D3D12_HEAP_PROPERTIES upProps = {};
-          upProps.Type = D3D12_HEAP_TYPE_UPLOAD;
-          D3D12_RESOURCE_DESC bufDesc = {};
-          bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-          bufDesc.Width = qkvBytes;
-          bufDesc.Height = 1;
-          bufDesc.DepthOrArraySize = 1;
-          bufDesc.MipLevels = 1;
-          bufDesc.Format = DXGI_FORMAT_UNKNOWN;
-          bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-          bufDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+         D3D12_HEAP_PROPERTIES defProps = {};
+         defProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+         D3D12_HEAP_PROPERTIES upProps = {};
+         upProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+         D3D12_RESOURCE_DESC bufDesc = {};
+         bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+         bufDesc.Width = qBytes;
+         bufDesc.Height = 1;
+         bufDesc.DepthOrArraySize = 1;
+         bufDesc.MipLevels = 1;
+         bufDesc.Format = DXGI_FORMAT_UNKNOWN;
+         bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+         bufDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
 
-          // Q, K, V buffers (will be copied to, then used as SRV)
-          dev->CreateCommittedResource(&defProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
-              D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&qBuffer));
-          dev->CreateCommittedResource(&defProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
-              D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&kBuffer));
-          dev->CreateCommittedResource(&defProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
-              D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&vBuffer));
+         // Q buffer (copied to, then used as SRV) - only the current token, no K/V buffers
+         // needed here anymore; the shader reads m_kvCache's buffers directly as UAVs.
+         dev->CreateCommittedResource(&defProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
+             D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&qBuffer));
 
-          // Output buffer needs UAV
-          bufDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-          dev->CreateCommittedResource(&defProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
-              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&outBuffer));
+         // Output buffer needs UAV
+         bufDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+         dev->CreateCommittedResource(&defProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
+             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&outBuffer));
 
-          bufDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
-          D3D12_RESOURCE_DESC upDesc = {};
-          upDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-          upDesc.Width = qkvBytes;
-          upDesc.Height = 1;
-          upDesc.DepthOrArraySize = 1;
-          upDesc.MipLevels = 1;
-          upDesc.Format = DXGI_FORMAT_UNKNOWN;
-          upDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-          upDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+         D3D12_RESOURCE_DESC upDesc = {};
+         upDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+         upDesc.Width = qBytes;
+         upDesc.Height = 1;
+         upDesc.DepthOrArraySize = 1;
+         upDesc.MipLevels = 1;
+         upDesc.Format = DXGI_FORMAT_UNKNOWN;
+         upDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+         upDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
 
-          dev->CreateCommittedResource(&upProps, D3D12_HEAP_FLAG_NONE, &upDesc,
-              D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&qUpload));
-          dev->CreateCommittedResource(&upProps, D3D12_HEAP_FLAG_NONE, &upDesc,
-              D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&kUpload));
-          dev->CreateCommittedResource(&upProps, D3D12_HEAP_FLAG_NONE, &upDesc,
-              D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&vUpload));
+         dev->CreateCommittedResource(&upProps, D3D12_HEAP_FLAG_NONE, &upDesc,
+             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&qUpload));
 
-         // Upload data to upload heaps
+         // Upload Q to upload heap
          void* p;
          qUpload->Map(0, nullptr, &p);
-         std::memcpy(p, Q.data(), qkvBytes);
+         std::memcpy(p, Q.data(), qBytes);
          qUpload->Unmap(0, nullptr);
-         kUpload->Map(0, nullptr, &p);
-         std::memcpy(p, K.data(), qkvBytes);
-         kUpload->Unmap(0, nullptr);
-         vUpload->Map(0, nullptr, &p);
-         std::memcpy(p, V.data(), qkvBytes);
-         vUpload->Unmap(0, nullptr);
 
          // Compile FlashAttention shader if needed
          if (!m_flashAttnPSO) {
@@ -1830,44 +1953,47 @@ D3D12_HEAP_PROPERTIES defProps = {};
          dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, alloc.Get(),
              m_flashAttnPSO.Get(), IID_PPV_ARGS(&list));
 
-         // Set constants: 4 uints + 1 float = needs 2 vec4 slots
-         struct { uint32_t BatchSize, NumHeads, HeadDim, SeqLen; float InvSqrtD; } attnConsts;
-         attnConsts.BatchSize = 1;
-         attnConsts.NumHeads = (uint32_t)nHeads;
-         attnConsts.HeadDim = (uint32_t)headDim;
-         attnConsts.SeqLen = (uint32_t)seqLen;
-         attnConsts.InvSqrtD = 1.0f / std::sqrt((float)headDim);
+         // Must match AttentionConstants in TurboKernels.hlsl exactly (10 x 32-bit values).
+         struct {
+             uint32_t BatchSize, NumHeads, HeadDim, SeqLen;
+             float    InvSqrtD;
+             uint32_t MaxSeqLen, QuantType, HeadStrideBytes;
+             uint32_t NumLayers, LayerIdx;
+         } attnConsts;
+         attnConsts.BatchSize       = 1;
+         attnConsts.NumHeads        = (uint32_t)nHeads;
+         attnConsts.HeadDim         = (uint32_t)headDim;
+         attnConsts.SeqLen          = (uint32_t)seqLen;
+         attnConsts.InvSqrtD        = 1.0f / std::sqrt((float)headDim);
+         attnConsts.MaxSeqLen       = m_kvCache.GetConfig().MaxSequenceLength;
+         attnConsts.QuantType       = (uint32_t)m_kvCache.GetConfig().QuantType;
+         attnConsts.HeadStrideBytes = (uint32_t)m_kvCache.GetHeadStrideBytes();
+         attnConsts.NumLayers       = m_kvCache.GetConfig().NumLayers;
+         attnConsts.LayerIdx        = layerIdx;
 
          list->SetPipelineState(m_flashAttnPSO.Get());
          list->SetComputeRootSignature(m_flashAttnRootSig.Get());
-         list->SetComputeRoot32BitConstants(0, 5, &attnConsts, 0);
+         list->SetComputeRoot32BitConstants(0, 10, &attnConsts, 0);
          list->SetComputeRootShaderResourceView(1, qBuffer->GetGPUVirtualAddress());
-         list->SetComputeRootShaderResourceView(2, kBuffer->GetGPUVirtualAddress());
-         list->SetComputeRootShaderResourceView(3, vBuffer->GetGPUVirtualAddress());
+         list->SetComputeRootUnorderedAccessView(2, m_kvCache.GetKeyBuffer()->GetGPUVirtualAddress());
+         list->SetComputeRootUnorderedAccessView(3, m_kvCache.GetValueBuffer()->GetGPUVirtualAddress());
          list->SetComputeRootUnorderedAccessView(4, outBuffer->GetGPUVirtualAddress());
 
-         // Copy Q, K, V from upload heaps to default heaps
-         list->CopyBufferRegion(qBuffer.Get(), 0, qUpload.Get(), 0, qkvBytes);
-         list->CopyBufferRegion(kBuffer.Get(), 0, kUpload.Get(), 0, qkvBytes);
-         list->CopyBufferRegion(vBuffer.Get(), 0, vUpload.Get(), 0, qkvBytes);
+         // Copy Q from upload heap to default heap
+         list->CopyBufferRegion(qBuffer.Get(), 0, qUpload.Get(), 0, qBytes);
 
-         // Transition Q, K, V buffers: COPY_DEST -> NON_PIXEL_SHADER_RESOURCE
-         D3D12_RESOURCE_BARRIER toSRV[3] = {};
-         toSRV[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-         toSRV[0].Transition.pResource = qBuffer.Get();
-         toSRV[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-         toSRV[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-         toSRV[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-         toSRV[1].Transition.pResource = kBuffer.Get();
-         toSRV[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-         toSRV[1].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-         toSRV[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-         toSRV[2].Transition.pResource = vBuffer.Get();
-         toSRV[2].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-         toSRV[2].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-         list->ResourceBarrier(3, toSRV);
+         // Transition Q buffer: COPY_DEST -> NON_PIXEL_SHADER_RESOURCE
+         // (m_kvCache's K/V buffers are already UAV-resident; WriteTokenKV always
+         // leaves them in UNORDERED_ACCESS state, matching what this dispatch needs.)
+         D3D12_RESOURCE_BARRIER toSRV = {};
+         toSRV.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+         toSRV.Transition.pResource = qBuffer.Get();
+         toSRV.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+         toSRV.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+         list->ResourceBarrier(1, &toSRV);
 
-         list->Dispatch((uint32_t)seqLen, (uint32_t)nHeads, 1);
+         // Decode-only: exactly one query token per dispatch (see kernel comment).
+         list->Dispatch(1, (uint32_t)nHeads, 1);
          list->Close();
 
          ID3D12CommandList* ls[] = { list.Get() };
@@ -1881,7 +2007,7 @@ D3D12_HEAP_PROPERTIES defProps = {};
           rbProps.Type = D3D12_HEAP_TYPE_READBACK;
           D3D12_RESOURCE_DESC rbDesc = {};
           rbDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-          rbDesc.Width = qkvBytes;
+          rbDesc.Width = qBytes;
           rbDesc.Height = 1;
           rbDesc.DepthOrArraySize = 1;
           rbDesc.MipLevels = 1;
@@ -1905,7 +2031,7 @@ D3D12_HEAP_PROPERTIES defProps = {};
          toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
          list2->ResourceBarrier(1, &toCopy);
-         list2->CopyBufferRegion(readback.Get(), 0, outBuffer.Get(), 0, qkvBytes);
+         list2->CopyBufferRegion(readback.Get(), 0, outBuffer.Get(), 0, qBytes);
          list2->Close();
          ID3D12CommandList* ls2[] = { list2.Get() };
          m_dxEngine->GetComputeQueue()->ExecuteCommandLists(1, ls2);
@@ -1914,7 +2040,7 @@ D3D12_HEAP_PROPERTIES defProps = {};
 
          out.resize((size_t)nHeads * headDim);
          readback->Map(0, nullptr, &p);
-         std::memcpy(out.data(), p, qkvBytes);
+         std::memcpy(out.data(), p, qBytes);
          readback->Unmap(0, nullptr);
 
          m_gpuDispatchedOperators += 2;
@@ -1933,21 +2059,38 @@ D3D12_HEAP_PROPERTIES defProps = {};
              return false;
          }
 
+         // Root param layout MUST match TurboKernels.hlsl's FusedFlashAttentionKernel
+         // register declarations exactly:
+         //   b0 = AttentionConstants (10 x 32-bit values, see AttentionConstants struct)
+         //   t0 = QueryBuffer   (SRV)
+         //   u1 = KeyBuffer     (UAV, RWByteAddressBuffer - bound straight from KVCacheManager)
+         //   u2 = ValueBuffer   (UAV, RWByteAddressBuffer - bound straight from KVCacheManager)
+         //   u0 = AttnOutput    (UAV, RWStructuredBuffer<float>)
+         // Previous version bound SRVs at t1/t2/t3 while the shader declared t0/t1/t2,
+         // which silently shifted every buffer by one slot.
          D3D12_ROOT_PARAMETER rootParams[5] = {};
          rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
          rootParams[0].Constants.ShaderRegister = 0;
-         rootParams[0].Constants.Num32BitValues = 5; // 4 uints + 1 float
+         rootParams[0].Constants.Num32BitValues = 10; // see AttentionConstants
          rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-         for (int i = 1; i <= 3; i++) {
-             rootParams[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-             rootParams[i].Descriptor.ShaderRegister = (UINT)i;
-             rootParams[i].Descriptor.RegisterSpace = 0;
-             rootParams[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-         }
+         rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+         rootParams[1].Descriptor.ShaderRegister = 0; // t0 = QueryBuffer
+         rootParams[1].Descriptor.RegisterSpace = 0;
+         rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+         rootParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+         rootParams[2].Descriptor.ShaderRegister = 1; // u1 = KeyBuffer
+         rootParams[2].Descriptor.RegisterSpace = 0;
+         rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+         rootParams[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+         rootParams[3].Descriptor.ShaderRegister = 2; // u2 = ValueBuffer
+         rootParams[3].Descriptor.RegisterSpace = 0;
+         rootParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
          rootParams[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-         rootParams[4].Descriptor.ShaderRegister = 0;
+         rootParams[4].Descriptor.ShaderRegister = 0; // u0 = AttnOutput
          rootParams[4].Descriptor.RegisterSpace = 0;
          rootParams[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 

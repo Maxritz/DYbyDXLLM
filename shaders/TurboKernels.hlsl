@@ -20,40 +20,94 @@
 #define WARP_SIZE   32       // forced below with [WaveSize(32)]
 #define MAX_HEAD_DIM 128     // max head dimension supported
 
+// KV cache quant type IDs, must match DirectLLM::KVCacheQuantType enum order exactly.
+#define KVQ_FP32 0
+#define KVQ_FP16 1
+#define KVQ_FP8  2
+#define KVQ_INT8 3
+#define KVQ_INT4 4
+
 struct AttentionConstants {
     uint  BatchSize;
     uint  NumHeads;
-    uint  HeadDim;    // actual head dimension (<=MAX_HEAD_DIM)
-    uint  SeqLen;
-    float InvSqrtD;  // 1/sqrt(HeadDim) pre-computed
+    uint  HeadDim;        // actual head dimension (<=MAX_HEAD_DIM)
+    uint  SeqLen;         // number of VALID cached positions to attend over (current cache length)
+    float InvSqrtD;       // 1/sqrt(HeadDim) pre-computed
+    uint  MaxSeqLen;      // allocated cache capacity; needed for stride math, != SeqLen
+    uint  QuantType;      // KVQ_* : how KeyBuffer/ValueBuffer slots are packed
+    uint  HeadStrideBytes;// bytes per (layer, head, seqPos) slot, from KVCacheManager::GetHeadStrideBytes()
+    uint  NumLayers;      // total transformer layers sharing this cache buffer
+    uint  LayerIdx;       // which layer's region this dispatch reads/writes
 };
 
 ConstantBuffer<AttentionConstants> attnConfig : register(b0);
 
-StructuredBuffer<float>   QueryBuffer  : register(t0); // [Batch, Heads, Seq, HeadDim] FP32
-StructuredBuffer<float>   KeyBuffer    : register(t1);
-StructuredBuffer<float>   ValueBuffer  : register(t2);
-RWStructuredBuffer<float> AttnOutput   : register(u0); // [Batch, Heads, Seq, HeadDim] FP32
+// Query is always exactly one token (this kernel is decode-only: one new token
+// attending over cached history). [Heads, HeadDim] FP32, no Batch/Seq stride needed.
+StructuredBuffer<float>   QueryBuffer  : register(t0);
 
-// One wave = one query position.
-// Grid: Dispatch(SeqLen, NumHeads, BatchSize)
+// KV cache buffers, bound directly from KVCacheManager::GetKeyBuffer()/GetValueBuffer().
+// Head-major layout, byte-addressed because slot size/format depends on QuantType.
+// Persistently UAV (KVCacheManager never leaves them in another state), so bound as UAV here too.
+RWByteAddressBuffer        KeyBuffer    : register(u1);
+RWByteAddressBuffer        ValueBuffer  : register(u2);
+
+RWStructuredBuffer<float> AttnOutput   : register(u0); // [Heads, HeadDim] FP32, one token
+
+// Dequantise element `idx` (0..HeadDim-1) of the head-slot starting at byte `rowBase`.
+// Must exactly mirror KVCacheManager::QuantizeVector's CPU-side encode.
+float DequantElement(RWByteAddressBuffer buf, uint rowBase, uint idx) {
+    if (attnConfig.QuantType == KVQ_FP32) {
+        return asfloat(buf.Load(rowBase + idx * 4));
+    } else if (attnConfig.QuantType == KVQ_FP16) {
+        uint wordOffset = rowBase + (idx / 2) * 4;
+        uint word = buf.Load(wordOffset);
+        uint half_ = (idx % 2 == 0) ? (word & 0xFFFF) : (word >> 16);
+        return f16tof32(half_);
+    } else if (attnConfig.QuantType == KVQ_FP8) {
+        uint byteOffset = rowBase + idx;
+        uint word = buf.Load(byteOffset & ~3u);
+        uint shift = (byteOffset & 3u) * 8;
+        uint byteVal = (word >> shift) & 0xFF;
+        // Must mirror FloatToFP8: byte 0=-448, 128=0, 255=+447 (linear map)
+        return ((float)byteVal / 127.5f - 1.0f) * 448.0f;
+    } else if (attnConfig.QuantType == KVQ_INT8) {
+        float scale = asfloat(buf.Load(rowBase));
+        uint byteOffset = rowBase + 4 + idx;
+        uint word = buf.Load(byteOffset & ~3u);
+        uint shift = (byteOffset & 3u) * 8;
+        int sv = (int)((word >> shift) & 0xFF);
+        if (sv >= 128) sv -= 256; // sign-extend 8-bit
+        return (float)sv * scale;
+    } else { // KVQ_INT4
+        float scale = asfloat(buf.Load(rowBase));
+        uint nibbleByteOffset = rowBase + 4 + (idx / 2);
+        uint word = buf.Load(nibbleByteOffset & ~3u);
+        uint shift = (nibbleByteOffset & 3u) * 8;
+        uint byteVal = (word >> shift) & 0xFF;
+        uint nibble = (idx % 2 == 0) ? (byteVal & 0x0F) : (byteVal >> 4);
+        return ((float)nibble - 8.0f) * scale; // same +8 bias as CPU INT4 encode
+    }
+}
+
+// One wave = one (query, head) pair. Decode-only: exactly one query token per dispatch.
+// Grid: Dispatch(1, NumHeads, BatchSize)
 [WaveSize(32)]
 [numthreads(WARP_SIZE, 1, 1)]
 void FusedFlashAttentionKernel(uint3 dtid  : SV_DispatchThreadID,
                                 uint3 gtid  : SV_GroupThreadID,
                                 uint3 gid   : SV_GroupID) {
     uint lane    = gtid.x;
-    uint qRow    = gid.x;   // query position in sequence
     uint headIdx = gid.y;
     uint batch   = gid.z;
 
-    if (qRow >= attnConfig.SeqLen || headIdx >= attnConfig.NumHeads) return;
+    if (headIdx >= attnConfig.NumHeads) return;
 
     uint headDim = attnConfig.HeadDim;
-    uint qBase   = ((batch * attnConfig.NumHeads + headIdx) * attnConfig.SeqLen + qRow) * headDim;
+    uint qBase   = headIdx * headDim; // single token: no Batch/Seq stride
 
     // Load Q into registers (each lane holds a slice; loop for headDim > WARP_SIZE)
-    float q[MAX_HEAD_DIM / WARP_SIZE]; // each lane holds headDim/WARP_SIZE elements
+    float q[MAX_HEAD_DIM / WARP_SIZE];
     uint elementsPerLane = (headDim + WARP_SIZE - 1) / WARP_SIZE;
     for (uint e = 0; e < elementsPerLane; ++e) {
         uint d = lane + e * WARP_SIZE;
@@ -68,24 +122,22 @@ void FusedFlashAttentionKernel(uint3 dtid  : SV_DispatchThreadID,
     for (uint e = 0; e < elementsPerLane; ++e) acc[e] = 0.0f;
 
     uint numKVTiles = (attnConfig.SeqLen + WARP_SIZE - 1) / WARP_SIZE;
+    uint rowStride = attnConfig.HeadStrideBytes;
 
     for (uint tileIdx = 0; tileIdx < numKVTiles; ++tileIdx) {
-        uint kPos  = tileIdx * WARP_SIZE + lane; // key position this lane handles
+        uint kPos = tileIdx * WARP_SIZE + lane; // cached position this lane handles
 
-        // ---- QK dot product ----
-        // Each lane computes dot(Q[qRow], K[kPos]) cooperatively.
-        // We need every lane to have the full score for its kPos.
+        // No causal mask needed: SeqLen is the cache's current fill length, which by
+        // construction only ever contains this token and strictly earlier ones.
         float score = 0.0f;
         if (kPos < attnConfig.SeqLen) {
-            uint kBase = ((batch * attnConfig.NumHeads + headIdx) * attnConfig.SeqLen + kPos) * headDim;
+            uint kRowBase = (((batch * attnConfig.NumLayers + attnConfig.LayerIdx) * attnConfig.NumHeads + headIdx)
+                              * attnConfig.MaxSeqLen + kPos) * rowStride;
             for (uint e = 0; e < elementsPerLane; ++e) {
                 uint d = lane + e * WARP_SIZE;
-                if (d < headDim) score += q[e] * KeyBuffer[kBase + d];
+                if (d < headDim) score += q[e] * DequantElement(KeyBuffer, kRowBase, d);
             }
-            // Sum partial dot products across all lanes (each computes different d elements)
             score = WaveActiveSum(score) * attnConfig.InvSqrtD;
-            // Causal mask: future tokens get -inf
-            if (kPos > qRow) score = -1e30f;
         } else {
             score = -1e30f;
         }
@@ -94,20 +146,20 @@ void FusedFlashAttentionKernel(uint3 dtid  : SV_DispatchThreadID,
         float tileMax = WaveActiveMax(score);
         float newMax  = max(runningMax, tileMax);
 
-        float p         = exp(score    - newMax); // softmax numerator for this kPos
-        float rescale   = exp(runningMax - newMax);
-
-        float tileSum   = WaveActiveSum(p);
+        float p       = exp(score - newMax);
+        float rescale = exp(runningMax - newMax);
+        float tileSum = WaveActiveSum(p);
 
         runningSum = runningSum * rescale + tileSum;
         runningMax = newMax;
 
         // ---- Weighted V accumulation ----
         if (kPos < attnConfig.SeqLen) {
-            uint vBase = ((batch * attnConfig.NumHeads + headIdx) * attnConfig.SeqLen + kPos) * headDim;
+            uint vRowBase = (((batch * attnConfig.NumLayers + attnConfig.LayerIdx) * attnConfig.NumHeads + headIdx)
+                              * attnConfig.MaxSeqLen + kPos) * rowStride;
             for (uint e = 0; e < elementsPerLane; ++e) {
                 uint d = lane + e * WARP_SIZE;
-                float vVal = (d < headDim) ? ValueBuffer[vBase + d] : 0.0f;
+                float vVal = (d < headDim) ? DequantElement(ValueBuffer, vRowBase, d) : 0.0f;
                 acc[e] = acc[e] * rescale + p * vVal;
             }
         } else {
@@ -118,7 +170,7 @@ void FusedFlashAttentionKernel(uint3 dtid  : SV_DispatchThreadID,
 
     // ---- Write normalised output ----
     float invSum = (runningSum > 0.0f) ? (1.0f / runningSum) : 0.0f;
-    uint outBase = ((batch * attnConfig.NumHeads + headIdx) * attnConfig.SeqLen + qRow) * headDim;
+    uint outBase = headIdx * headDim; // single token output, no Batch/Seq stride
     for (uint e = 0; e < elementsPerLane; ++e) {
         uint d = lane + e * WARP_SIZE;
         if (d < headDim)

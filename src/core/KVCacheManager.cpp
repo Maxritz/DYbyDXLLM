@@ -53,20 +53,38 @@ namespace DirectLLM {
         m_config = config;
         m_sequenceLengths.assign(config.BatchSize, 0);
 
-        uint32_t headsTimeDim = config.NumHeads * config.HeadDimension;
+        // Head-major layout: each (batch, head, seqPos) slot holds one head's
+        // quantised HeadDimension-length vector, matching QuantizeVector(n=HeadDimension).
+        // This must mirror QuantizeVector's byte layout exactly (see that function for
+        // the embedded-scale format used by INT8/INT4).
+        uint32_t headDim = config.HeadDimension;
+        switch (m_config.QuantType) {
+            case KVCacheQuantType::None_FP32:
+                m_headStrideBytes = (size_t)headDim * 4;
+                break;
+            case KVCacheQuantType::None_FP16:
+                m_headStrideBytes = (size_t)headDim * 2;
+                break;
+            case KVCacheQuantType::FP8:
+                m_headStrideBytes = (size_t)headDim;
+                break;
+            case KVCacheQuantType::INT8:
+                m_headStrideBytes = sizeof(float) + (size_t)headDim;
+                break;
+            case KVCacheQuantType::INT4:
+                m_headStrideBytes = sizeof(float) + (size_t)((headDim + 1) / 2);
+                break;
+            default:
+                m_headStrideBytes = (size_t)headDim * 2;
+                break;
+        }
 
-        // INT4: 2 elements per byte
-        size_t elementBytes = (m_config.QuantType == KVCacheQuantType::INT4)
-                              ? (headsTimeDim / 2)
-                              : (headsTimeDim * BytesPerElement());
-
-        // Token stride = bytes needed per sequence position (one K or V vector)
-        m_tokenStrideBytes = elementBytes;
-
-        // Total: batch * maxSeq * token_stride
+        // Total: batch * numLayers * numHeads * maxSeq * headStride
         m_bufferSizeInBytes = (size_t)config.BatchSize
+                            * config.NumLayers
+                            * config.NumHeads
                             * config.MaxSequenceLength
-                            * m_tokenStrideBytes;
+                            * m_headStrideBytes;
 
         if (m_bufferSizeInBytes == 0) {
             std::cerr << "[KVCache] Buffer size zero - check config." << std::endl;
@@ -185,43 +203,36 @@ namespace DirectLLM {
                                        ID3D12CommandQueue* queue,
                                        HANDLE              fenceEvent,
                                        uint32_t            batchIdx,
+                                       uint32_t            layerIdx,
                                        uint32_t            seqPos,
                                        const float*        keyData,
                                        const float*        valueData) {
         if (!m_keyBuffer || !m_valueBuffer) return false;
         if (batchIdx >= m_config.BatchSize)  return false;
+        if (layerIdx >= m_config.NumLayers)  return false;
         if (seqPos   >= m_config.MaxSequenceLength) return false;
 
-        uint32_t n = m_config.NumHeads * m_config.HeadDimension;
+        uint32_t headDim  = m_config.HeadDimension;
+        uint32_t numHeads = m_config.NumHeads;
+        size_t totalBytes = (size_t)numHeads * m_headStrideBytes;
 
-        // Quantize key and value on CPU
-        // Worst case: FP32 scale(4) + n bytes; allocate generously
-        size_t quantBufSize = sizeof(float) + n * sizeof(float);
-        std::vector<uint8_t> quantKey(quantBufSize, 0);
-        std::vector<uint8_t> quantVal(quantBufSize, 0);
-
-        size_t keyBytes = QuantizeVector(keyData,   quantKey.data(), n);
-        size_t valBytes = QuantizeVector(valueData, quantVal.data(), n);
-
-        if (keyBytes == 0 || valBytes == 0) return false;
-
-        // Offset into the KV buffer: [batchIdx][seqPos] * tokenStride
-        size_t slotOffset = ((size_t)batchIdx * m_config.MaxSequenceLength + seqPos)
-                           * m_tokenStrideBytes;
-
-        if (slotOffset + keyBytes > m_bufferSizeInBytes) {
-            std::cerr << "[KVCache] WriteTokenKV: offset out of bounds at seqPos=" << seqPos << std::endl;
-            return false;
+        // Quantise each head's HeadDimension-length vector separately (per-head scale
+        // for INT8/INT4, matching how the attention shader reads slots independently).
+        std::vector<uint8_t> quantKey(totalBytes, 0);
+        std::vector<uint8_t> quantVal(totalBytes, 0);
+        for (uint32_t h = 0; h < numHeads; ++h) {
+            QuantizeVector(keyData   + (size_t)h * headDim,
+                            quantKey.data() + (size_t)h * m_headStrideBytes, headDim);
+            QuantizeVector(valueData + (size_t)h * headDim,
+                            quantVal.data() + (size_t)h * m_headStrideBytes, headDim);
         }
 
-        // Allocate a temporary upload buffer large enough for both K and V
-        size_t uploadSize = std::max(keyBytes, valBytes);
-
+        // Allocate a temporary upload buffer large enough for all heads of one K or V write
         D3D12_HEAP_PROPERTIES uploadHeap = {};
         uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC uploadDesc = {};
         uploadDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
-        uploadDesc.Width            = uploadSize;
+        uploadDesc.Width            = totalBytes;
         uploadDesc.Height           = 1;
         uploadDesc.DepthOrArraySize = 1;
         uploadDesc.MipLevels        = 1;
@@ -235,16 +246,16 @@ namespace DirectLLM {
             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuf));
         if (FAILED(hr)) return false;
 
-        // Helper: perform one key or value write
-        auto writeBuffer = [&](const uint8_t* quantData, size_t numBytes,
-                               ID3D12Resource* gpuBuf) -> bool {
-            // Map upload buffer and copy quantized data
+        // Helper: write all heads of one K or V vector in a single submit.
+        // Destination offsets are head-strided (non-contiguous), so this issues
+        // one CopyBufferRegion per head, but only ONE command list submit + wait
+        // per K/V write (not per head) to avoid multiplying GPU round-trips.
+        auto writeBuffer = [&](const uint8_t* quantData, ID3D12Resource* gpuBuf) -> bool {
             void* pMap = nullptr;
             if (FAILED(uploadBuf->Map(0, nullptr, &pMap))) return false;
-            std::memcpy(pMap, quantData, numBytes);
+            std::memcpy(pMap, quantData, totalBytes);
             uploadBuf->Unmap(0, nullptr);
 
-            // Create a fresh command allocator + list for this write
             ComPtr<ID3D12CommandAllocator> alloc;
             if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE,
                     IID_PPV_ARGS(&alloc)))) return false;
@@ -252,7 +263,6 @@ namespace DirectLLM {
             if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
                     alloc.Get(), nullptr, IID_PPV_ARGS(&list)))) return false;
 
-            // Transition GPU buffer: UAV -> COPY_DEST
             D3D12_RESOURCE_BARRIER toCD = {};
             toCD.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             toCD.Transition.pResource   = gpuBuf;
@@ -261,10 +271,17 @@ namespace DirectLLM {
             toCD.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             list->ResourceBarrier(1, &toCD);
 
-            // Copy just the quantized token slot
-            list->CopyBufferRegion(gpuBuf, slotOffset, uploadBuf.Get(), 0, numBytes);
+            for (uint32_t h = 0; h < numHeads; ++h) {
+                size_t dstOffset = ((((size_t)batchIdx * m_config.NumLayers + layerIdx) * numHeads + h)
+                                    * m_config.MaxSequenceLength + seqPos) * m_headStrideBytes;
+                size_t srcOffset = (size_t)h * m_headStrideBytes;
+                if (dstOffset + m_headStrideBytes > m_bufferSizeInBytes) {
+                    std::cerr << "[KVCache] WriteTokenKV: offset out of bounds at seqPos=" << seqPos << std::endl;
+                    return false;
+                }
+                list->CopyBufferRegion(gpuBuf, dstOffset, uploadBuf.Get(), srcOffset, m_headStrideBytes);
+            }
 
-            // Transition back: COPY_DEST -> UAV
             D3D12_RESOURCE_BARRIER toUAV = {};
             toUAV.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             toUAV.Transition.pResource   = gpuBuf;
@@ -278,7 +295,6 @@ namespace DirectLLM {
             ID3D12CommandList* ls[] = { list.Get() };
             queue->ExecuteCommandLists(1, ls);
 
-            // Signal and wait (event-based)
             ComPtr<ID3D12Fence> fence;
             device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
             queue->Signal(fence.Get(), 1);
@@ -289,8 +305,8 @@ namespace DirectLLM {
             return true;
         };
 
-        if (!writeBuffer(quantKey.data(), keyBytes, m_keyBuffer.Get()))   return false;
-        if (!writeBuffer(quantVal.data(), valBytes, m_valueBuffer.Get())) return false;
+        if (!writeBuffer(quantKey.data(), m_keyBuffer.Get()))   return false;
+        if (!writeBuffer(quantVal.data(), m_valueBuffer.Get())) return false;
 
         return true;
     }
@@ -323,6 +339,6 @@ namespace DirectLLM {
         m_valueBuffer.Reset();
         m_sequenceLengths.clear();
         m_bufferSizeInBytes = 0;
-        m_tokenStrideBytes  = 0;
+        m_headStrideBytes   = 0;
     }
 }
