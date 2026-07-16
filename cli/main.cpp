@@ -219,43 +219,80 @@ int main(int argc, char* argv[]) {
     if (modelLoaded) {
         if (ggufLoader.HasMetadata("general.architecture")) {
             std::string arch = ggufLoader.GetMetadataString("general.architecture");
-            if (arch == "laguna") {
+            std::string archLower;
+            for (char c : arch) archLower += tolower(c);
+            if (archLower.find("laguna") != std::string::npos) {
                 config.Arch = ModelArchitecture::Laguna;
-            } else if (arch == "llama") {
+            } else if (archLower.find("llama") != std::string::npos) {
                 config.Arch = ModelArchitecture::Llama;
-            } else if (arch == "phi") {
+            } else if (archLower.find("phi") != std::string::npos) {
                 config.Arch = ModelArchitecture::Phi;
-            } else if (arch == "gemma") {
+            } else if (archLower.find("gemma") != std::string::npos) {
                 config.Arch = ModelArchitecture::Gemma;
-            } else if (arch == "deepseek") {
+            } else if (archLower.find("deepseek") != std::string::npos) {
                 config.Arch = ModelArchitecture::DeepSeek;
             }
         }
-        
+
+        // Extract config based on architecture - support all variants
+        auto getMeta = [&](const std::string& key) -> uint32_t {
+            return ggufLoader.HasMetadata(key) ? ggufLoader.GetMetadataUint32(key) : 0;
+        };
+
+        // Block count - try all arch variants
+        if (getMeta("llama.block_count")) config.NumLayers = getMeta("llama.block_count");
+        else if (getMeta("qwen2.block_count")) config.NumLayers = getMeta("qwen2.block_count");
+        else if (getMeta("qwen35.block_count")) config.NumLayers = getMeta("qwen35.block_count");
+        else if (getMeta("phi3.block_count")) config.NumLayers = getMeta("phi3.block_count");
+        else if (getMeta("gemma2.block_count")) config.NumLayers = getMeta("gemma2.block_count");
+        else if (getMeta("gemma4.block_count")) config.NumLayers = getMeta("gemma4.block_count");
+
+        // Hidden dim
+        if (getMeta("llama.embedding_length")) config.HiddenDim = getMeta("llama.embedding_length");
+        else if (getMeta("qwen2.embedding_length")) config.HiddenDim = getMeta("qwen2.embedding_length");
+        else if (getMeta("qwen35.embedding_length")) config.HiddenDim = getMeta("qwen35.embedding_length");
+        else if (getMeta("phi3.embedding_length")) config.HiddenDim = getMeta("phi3.embedding_length");
+        else if (getMeta("gemma2.embedding_length")) config.HiddenDim = getMeta("gemma2.embedding_length");
+        else if (getMeta("gemma4.embedding_length")) config.HiddenDim = getMeta("gemma4.embedding_length");
+
+        // Attention heads
+        if (getMeta("llama.attention.head_count")) config.NumHeads = getMeta("llama.attention.head_count");
+        else if (getMeta("qwen2.attention.head_count")) config.NumHeads = getMeta("qwen2.attention.head_count");
+        else if (getMeta("qwen35.attention.head_count")) config.NumHeads = getMeta("qwen35.attention.head_count");
+        else if (getMeta("phi3.attention.head_count")) config.NumHeads = getMeta("phi3.attention.head_count");
+        else if (getMeta("gemma2.attention.head_count")) config.NumHeads = getMeta("gemma2.attention.head_count");
+        else if (getMeta("gemma4.attention.head_count")) config.NumHeads = getMeta("gemma4.attention.head_count");
+
+        // Feed forward length (intermediate dim)
+        if (getMeta("llama.feed_forward_length")) config.IntermediateDim = getMeta("llama.feed_forward_length");
+        else if (getMeta("qwen2.feed_forward_length")) config.IntermediateDim = getMeta("qwen2.feed_forward_length");
+        else if (getMeta("qwen35.feed_forward_length")) config.IntermediateDim = getMeta("qwen35.feed_forward_length");
+        else if (getMeta("phi3.feed_forward_length")) config.IntermediateDim = getMeta("phi3.feed_forward_length");
+        else if (getMeta("gemma2.feed_forward_length")) config.IntermediateDim = getMeta("gemma2.feed_forward_length");
+        else if (getMeta("gemma4.feed_forward_length")) config.IntermediateDim = getMeta("gemma4.feed_forward_length");
+
+        if (config.IntermediateDim == 0) config.IntermediateDim = config.HiddenDim * 4;
+        config.HeadDim = config.HiddenDim / config.NumHeads;
+
         // MoE check
         if (ggufLoader.HasMetadata("llama.expert_count") || ggufLoader.HasMetadata("deepseek.expert_count")) {
             config.Type = ModelType::MixtureOfExperts;
-            config.NumExperts = ggufLoader.HasMetadata("llama.expert_count") ? 
-                                ggufLoader.GetMetadataUint32("llama.expert_count") : 256;
+            config.NumExperts = ggufLoader.HasMetadata("llama.expert_count") ?
+                                ggufLoader.GetMetadataUint32("llama.expert_count") :
+                                ggufLoader.GetMetadataUint32("deepseek.expert_count");
             config.ActiveExpertsK = ggufLoader.HasMetadata("llama.expert_used_count") ?
                                     ggufLoader.GetMetadataUint32("llama.expert_used_count") : 2;
         }
 
-        if (ggufLoader.HasMetadata("llama.block_count"))
-            config.NumLayers = ggufLoader.GetMetadataUint32("llama.block_count");
-        if (ggufLoader.HasMetadata("llama.embedding_length"))
-            config.HiddenDim = ggufLoader.GetMetadataUint32("llama.embedding_length");
-        if (ggufLoader.HasMetadata("llama.attention.head_count"))
-            config.NumHeads = ggufLoader.GetMetadataUint32("llama.attention.head_count");
-        if (ggufLoader.HasMetadata("llama.feed_forward_length"))
-            config.IntermediateDim = ggufLoader.GetMetadataUint32("llama.feed_forward_length");
-        else
-            config.IntermediateDim = config.HiddenDim * 4;
-        config.HeadDim = config.HiddenDim / config.NumHeads;
-
-        const GgufTensor* tokEmb = ggufLoader.GetTensor("token_embd.weight");
-        if (tokEmb && tokEmb->Shape.size() >= 2)
-            config.VocabSize = (size_t)tokEmb->Shape[0];
+        // Vocab size from any embedding tensor
+        for (const auto& [name, tensor] : ggufLoader.GetTensors()) {
+            if (name.find("embed") != std::string::npos || name.find("tok_embeddings") != std::string::npos ||
+                name.find("output") != std::string::npos || name.find("lm_head") != std::string::npos) {
+                if (tensor.Shape.size() >= 1) {
+                    config.VocabSize = std::max(config.VocabSize, (size_t)tensor.Shape[0]);
+                }
+            }
+        }
     }
 
     // Force Stream dense check warning
@@ -287,6 +324,7 @@ for (char &c : lowerPrompt) c = tolower(c);
 
     for (int step = 0; step < opts.nPredict; step++) {
         // Run real GPU or fallback CPU/NPU inference step
+        auto stepStart = std::chrono::high_resolution_clock::now();
         bool ok = pipeline.RunInferenceStep(1, tokens, (uint32_t)step, logits);
         if (!ok) break;
 
@@ -325,28 +363,14 @@ for (char &c : lowerPrompt) c = tolower(c);
 
         // Verbose detailed prints
         if (opts.verbose) {
-            float latency = 4.2f + ((float)std::rand() / RAND_MAX) * 1.5f;
+            auto stepEnd = std::chrono::high_resolution_clock::now();
+            float latency = std::chrono::duration<float, std::milli>(stepEnd - stepStart).count();
             std::stringstream ss1;
             ss1 << std::fixed << std::setprecision(2) << latency;
-            log("QuantGEMM", "Token " + std::to_string(step) + " - Dispatch Compute Shader. Kernel dim: 1024x4096. Latency: " + ss1.str() + "ms", "TRACE");
-            log("KVCache", "Token " + std::to_string(step) + " - Key/Value allocated at PageIdx=" + std::to_string(step) + ". Sync fence value: " + std::to_string(step + 100), "TRACE");
-
-            bool isLaguna = (config.Arch == ModelArchitecture::Laguna) || 
-                            (lowerPrompt.find("laguna") != std::string::npos) ||
-                            (lowerPrompt.find("turboquant") != std::string::npos) ||
-                            (lowerPrompt.find("dspark") != std::string::npos) ||
-                            (lowerPrompt.find("dflash") != std::string::npos);
-            if (isLaguna) {
-                log("dflash", "Token " + std::to_string(step) + " - Fused FlashAttention compute pass executed on registers. occupancy=Wave32", "TRACE");
-                log("dspark", "Token " + std::to_string(step) + " - Dynamic MoE routing: dispatched active expert allocations on GPU.", "TRACE");
-                log("turboquant", "Token " + std::to_string(step) + " - Register-level bit-shifting dequantization unpacked q4_0 compressed weights.", "TRACE");
-            }
+            log("QuantGEMM", "Token " + std::to_string(step) + " - Dispatch Compute Shader. Latency: " + ss1.str() + "ms (measured)", "TRACE");
         }
 
-        if (opts.enableMtp) {
-            log("SpeculativeMTP", "Speculative token draft accepted [step=" + std::to_string(step) + "]! Validation check passed.", "TRACE");
-        }
-    }
+        } // end inference loop
     std::cout << "\n" << std::endl;
 
     // Write essay to file if requested

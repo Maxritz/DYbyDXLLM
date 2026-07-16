@@ -237,7 +237,7 @@ namespace DirectLLM {
             HANDLE              fenceEvent) {
 
         if (!m_hasModel || !m_ovInferRequest) {
-            return true; // No model loaded, skip silently
+            return false; // No model loaded
         }
         if (!d3d12BufferIn || !d3d12BufferOut || !device || !queue || !fenceEvent) {
             std::cerr << "[OpenVINO] ExecuteSharedOperator: null argument." << std::endl;

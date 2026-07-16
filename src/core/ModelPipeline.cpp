@@ -555,9 +555,49 @@ namespace DirectLLM {
         }
         CloseHandle(loadEvent);
 
-        std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " tensors. VRAM: "
-                  << (m_vramUsageBytes / (1024*1024)) << " MB, RAM: "
-                  << (m_systemRamUsageBytes / (1024*1024)) << " MB." << std::endl;
+std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " tensors. VRAM: "
+               << (m_vramUsageBytes / (1024*1024)) << " MB, RAM: "
+               << (m_systemRamUsageBytes / (1024*1024)) << " MB." << std::endl;
+
+        // Populate TransformerLayer structures from weight tensors
+        m_layers.clear();
+        m_layers.resize(m_config.NumLayers);
+        for (size_t l = 0; l < m_config.NumLayers; ++l) {
+            m_layers[l].LayerIndex = l;
+            m_layers[l].PrimaryLocation = DeviceLocation::GPU_VRAM;
+
+            // Extract layer tensors - support both GGUF naming conventions
+            std::string base = "blk." + std::to_string(l) + ".";
+            std::string baseAlt = "model.layers." + std::to_string(l) + ".";
+
+            auto getTensor = [&](const std::string& name) -> Tensor* {
+                auto it = m_weightTensors.find(name);
+                return (it != m_weightTensors.end()) ? &it->second : nullptr;
+            };
+            auto getTensorAlt = [&](const std::string& name1, const std::string& name2, const std::string& name3) -> Tensor* {
+                Tensor* t = getTensor(name1);
+                if (!t) t = getTensor(name2);
+                if (!t) t = getTensor(name3);
+                return t;
+            };
+
+            // Attention projections - support Llama, Gemma, Qwen naming
+            Tensor* qkv = getTensorAlt(base + "attn_qkv.weight", baseAlt + "self_attn.q_proj.weight", base + "attention.query_key_value.weight");
+            if (qkv) m_layers[l].QKV_Proj = *qkv;
+
+            Tensor* o = getTensorAlt(base + "attn_ov.weight", baseAlt + "self_attn.o_proj.weight", base + "attention.output.weight");
+            if (o) m_layers[l].O_Proj = *o;
+
+            // FFN projections (for non-MoE models) - support multiple naming conventions
+            Tensor* gate = getTensorAlt(base + "ffn_gate.weight", baseAlt + "mlp.gate_proj.weight", base + "mlp.gate.weight");
+            if (gate) m_layers[l].FFN_Gate_Proj = *gate;
+
+            Tensor* up = getTensorAlt(base + "ffn_up.weight", baseAlt + "mlp.up_proj.weight", base + "mlp.up.weight");
+            if (up) m_layers[l].FFN_Up_Proj = *up;
+
+            Tensor* down = getTensorAlt(base + "ffn_down.weight", baseAlt + "mlp.down_proj.weight", base + "mlp.down.weight");
+            if (down) m_layers[l].FFN_Down_Proj = *down;
+        }
 
         if (m_dxEngine) BuildGEMMPipeline();
 
@@ -640,37 +680,36 @@ namespace DirectLLM {
         if (lmHeadIt == m_weightTensors.end())
             lmHeadIt = m_weightTensors.find("lm_head.weight");
         if (lmHeadIt == m_weightTensors.end())
-            lmHeadIt = embedIt;
+            lmHeadIt = m_weightTensors.find("embed_tokens.weight"); // Phi-3 shares embed/lm_head
+        const Tensor* embedTensor = embedIt != m_weightTensors.end() ? &embedIt->second : nullptr;
+        const Tensor* lmHeadTensor = lmHeadIt != m_weightTensors.end() ? &lmHeadIt->second : nullptr;
 
-        if (embedIt != m_weightTensors.end() && lmHeadIt != m_weightTensors.end()) {
-            const Tensor& embedTensor  = embedIt->second;
-            const Tensor& lmHeadTensor = lmHeadIt->second;
-
+        if (embedTensor && lmHeadTensor) {
             // Build embedding vector X on CPU with correct dequantization
             std::vector<float> x(hidden, 0.0f);
-            if (!embedTensor.CPUHostData.empty()) {
-                if (embedTensor.QuantType == QuantizationType::None_FP32) {
-                    const float* embedData = reinterpret_cast<const float*>(embedTensor.CPUHostData.data());
+            if (!embedTensor->CPUHostData.empty()) {
+                if (embedTensor->QuantType == QuantizationType::None_FP32) {
+                    const float* embedData = reinterpret_cast<const float*>(embedTensor->CPUHostData.data());
                     size_t rowBytes = (size_t)hidden * sizeof(float);
                     size_t offset   = (size_t)tokId * rowBytes;
-                    if (offset + rowBytes <= embedTensor.CPUHostData.size())
+                    if (offset + rowBytes <= embedTensor->CPUHostData.size())
                         std::memcpy(x.data(), embedData + (size_t)tokId * hidden, rowBytes);
-                } else if (embedTensor.QuantType == QuantizationType::None_FP16) {
-                    const uint16_t* embedData = reinterpret_cast<const uint16_t*>(embedTensor.CPUHostData.data());
+                } else if (embedTensor->QuantType == QuantizationType::None_FP16) {
+                    const uint16_t* embedData = reinterpret_cast<const uint16_t*>(embedTensor->CPUHostData.data());
                     size_t rowElements = (size_t)hidden;
                     size_t offset      = (size_t)tokId * rowElements;
-                    if (offset + rowElements <= embedTensor.CPUHostData.size() / 2) {
+                    if (offset + rowElements <= embedTensor->CPUHostData.size() / 2) {
                         for (size_t i = 0; i < rowElements; ++i) {
                             x[i] = FP16ToFloat(embedData[offset + i]);
                         }
                     }
-                } else if (embedTensor.QuantType == QuantizationType::Q8_0) {
-                    const uint8_t* embedData = embedTensor.CPUHostData.data();
+                } else if (embedTensor->QuantType == QuantizationType::Q8_0) {
+                    const uint8_t* embedData = embedTensor->CPUHostData.data();
                     size_t blockSizeBytes = 34;
                     size_t blocksPerRow = (size_t)hidden / 32;
                     size_t rowBytes = blocksPerRow * blockSizeBytes;
                     size_t offset = (size_t)tokId * rowBytes;
-                    if (offset + rowBytes <= embedTensor.CPUHostData.size()) {
+                    if (offset + rowBytes <= embedTensor->CPUHostData.size()) {
                         const uint8_t* rowPtr = embedData + offset;
                         for (size_t b = 0; b < blocksPerRow; ++b) {
                             const uint8_t* blockPtr = rowPtr + b * blockSizeBytes;
@@ -683,20 +722,72 @@ namespace DirectLLM {
                             }
                         }
                     }
+                } else if (embedTensor->QuantType == QuantizationType::Q4_0) {
+                    const uint8_t* embedData = embedTensor->CPUHostData.data();
+                    size_t blocksPerRow = (size_t)hidden / 32;
+                    for (size_t b = 0; b < blocksPerRow; ++b) {
+                        size_t blockOffset = ((size_t)tokId * blocksPerRow + b) * 18;
+                        const uint8_t* blockPtr = embedData + blockOffset;
+                        uint16_t scale_raw;
+                        std::memcpy(&scale_raw, blockPtr, 2);
+                        float scale = FP16ToFloat(scale_raw);
+                        const uint8_t* qs = blockPtr + 2;
+                        for (size_t j = 0; j < 32; ++j) {
+                            uint8_t byte = qs[j / 2];
+                            uint8_t nibble = (j % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+                            x[b * 32 + j] = (float)nibble * scale;
+                        }
+                    }
                 } else {
-                    const float* embedData = reinterpret_cast<const float*>(embedTensor.CPUHostData.data());
+                    const float* embedData = reinterpret_cast<const float*>(embedTensor->CPUHostData.data());
                     size_t rowBytes = (size_t)hidden * sizeof(float);
                     size_t offset   = (size_t)tokId * rowBytes;
-                    if (offset + rowBytes <= embedTensor.CPUHostData.size())
+                    if (offset + rowBytes <= embedTensor->CPUHostData.size())
                         std::memcpy(x.data(), embedData + (size_t)tokId * hidden, rowBytes);
+                }
+            }
+
+            // ----------------------------------------------------------------
+            //  Transformer Layer Inference (Attention + FFN)
+            // ----------------------------------------------------------------
+            if (m_config.NumLayers > 0 && !m_layers.empty()) {
+                for (size_t layerIdx = 0; layerIdx < m_config.NumLayers; ++layerIdx) {
+                    const auto& layer = m_layers[layerIdx];
+                    
+                    // RMSNorm before attention
+                    // Note: Requires RMSNorm weights to be extracted into m_layers[l].RMSNorm_Attn, etc.
+                    
+                    // QKV projection -> Attention -> O projection
+                    // For now: skip GPU path, do CPU path for quantized weights
+                    if (layer.QKV_Proj.GPUResource && layer.O_Proj.GPUResource && m_dxEngine && m_gemmPSOReady) {
+                        // TODO: GPU attention path
+                    } else if (!layer.QKV_Proj.CPUHostData.empty()) {
+                        // CPU QKV projection
+                        size_t qkvHidden = layer.QKV_Proj.Shape.size() >= 2 ? layer.QKV_Proj.Shape[1] : hidden;
+                        std::vector<float> qkvOut(qkvHidden, 0.0f);
+                        // TODO: Implement actual matrix multiply
+                    }
+                    
+                    // FFN (Dense) or MoE
+                    if (m_config.Type == ModelType::MixtureOfExperts) {
+                        // TODO: MoE path
+                    } else if (!layer.FFN_Gate_Proj.CPUHostData.empty()) {
+                        // CPU FFN path
+                        // TODO: Implement SiLU + up/down projection
+                    }
                 }
             }
 
             // ----------------------------------------------------------------
             //  GPU path — lm_head is in VRAM
             // ----------------------------------------------------------------
-            if (lmHeadTensor.Location == DeviceLocation::GPU_VRAM &&
-                m_dxEngine && m_gemmPSOReady) {
+            bool isQuantized = (lmHeadTensor->QuantType == QuantizationType::Q4_0 ||
+                                lmHeadTensor->QuantType == QuantizationType::Q4_K ||
+                                lmHeadTensor->QuantType == QuantizationType::Q5_K ||
+                                lmHeadTensor->QuantType == QuantizationType::Q6_K);
+            bool hasGpuScales = lmHeadTensor->GPUScales || lmHeadTensor->GPUZeroPoints;
+            if (lmHeadTensor->Location == DeviceLocation::GPU_VRAM &&
+                m_dxEngine && m_gemmPSOReady && (!isQuantized || hasGpuScales)) {
 
                 size_t hiddenBytes = (size_t)hidden * sizeof(float);
                 size_t vocabBytes  = (size_t)vocab  * sizeof(float);
@@ -732,82 +823,13 @@ namespace DirectLLM {
                     m_inferCmdList->ResourceBarrier(1, &barrierX);
                 }
 
-                // Loop attention + FFN layer calculations NumLayers times
-                // to execute the real FLOPs of the complete transformer stack!
-                for (size_t layer = 0; layer < m_config.NumLayers; ++layer) {
-                    // 1. Dispatch Fused FlashAttention (dflash)
-                    m_opts.DispatchFusedAttention(
-                        m_inferCmdList.Get(),
-                        m_xGPUBuffer.Get(),
-                        m_xGPUBuffer.Get(),
-                        m_xGPUBuffer.Get(),
-                        m_yGPUBuffer.Get(), // output bound to m_yGPUBuffer
-                        1,
-                        1,  // numHeads
-                        32, // headDim
-                        32  // seqLen
-                    );
-
-                    // 2. Dispatch MoE routing & routing offloader (dspark)
-                    m_opts.DispatchMoEExpertLayers(
-                        m_inferCmdList.Get(),
-                        m_xGPUBuffer.Get(),
-                        m_xGPUBuffer.Get(),
-                        m_yGPUBuffer.Get(), // expertIds (UAV)
-                        m_yGPUBuffer.Get(), // expertWeights (UAV)
-                        1,   // numTokens
-                        1,   // numExperts
-                        1,   // activeK
-                        256  // hiddenDim
-                    );
-
-                    // 3. Dispatch TurboQuant dequantization (turboquant)
-                    m_opts.DispatchTurboQuantDequant(
-                        m_inferCmdList.Get(),
-                        m_xGPUBuffer.Get(),
-                        m_xGPUBuffer.Get(),
-                        m_xGPUBuffer.Get(),
-                        m_yGPUBuffer.Get(), // output bound to m_yGPUBuffer
-                        32, // numRows
-                        32, // numCols
-                        32  // groupSize
-                    );
-
-                    // 4. Execute OpenVINO interop NPU path
-                    if (m_openVINO.IsInitialized() && m_openVINO.GetActiveDevice() != "CPU") {
-                        m_openVINO.ExecuteSharedOperator(m_xGPUBuffer.Get(), m_yGPUBuffer.Get(), hidden,
-                            m_dxEngine->GetDevice(), m_dxEngine->GetComputeQueue(), m_inferFenceEvent);
-                    }
-
-                    // 5. Dispatch GEMM (layer FFN / projection)
-                    struct { uint32_t M, N, K; } layerConstants;
-                    layerConstants.M = 1;
-                    layerConstants.N = (uint32_t)hidden;
-                    layerConstants.K = (uint32_t)hidden;
-
-                    m_inferCmdList->SetComputeRootSignature(m_gemmRootSignature.Get());
-                    m_inferCmdList->SetPipelineState(m_gemmPSO.Get());
-                    m_inferCmdList->SetComputeRoot32BitConstants(0, 3, &layerConstants, 0);
-                    m_inferCmdList->SetComputeRootShaderResourceView(1, m_xGPUBuffer->GetGPUVirtualAddress());
-                    m_inferCmdList->SetComputeRootShaderResourceView(2, lmHeadTensor.GPUResource->GetGPUVirtualAddress());
-                    m_inferCmdList->SetComputeRootShaderResourceView(3, lmHeadTensor.GPUResource->GetGPUVirtualAddress());
-                    m_inferCmdList->SetComputeRootShaderResourceView(4, lmHeadTensor.GPUResource->GetGPUVirtualAddress());
-                    m_inferCmdList->SetComputeRootUnorderedAccessView(5, m_yGPUBuffer->GetGPUVirtualAddress());
-
-                    m_inferCmdList->Dispatch((layerConstants.N + 15) / 16, 1, 1);
-
-                    D3D12_RESOURCE_BARRIER uavBarrier = {};
-                    uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-                    uavBarrier.UAV.pResource = m_yGPUBuffer.Get();
-                    m_inferCmdList->ResourceBarrier(1, &uavBarrier);
-                }
-
-                // 6. Dispatch GEMM (final lm_head calculation)
+                // Dispatch GEMM (final lm_head projection)
+                // Reads from m_xGPUBuffer (hidden activations) → m_yGPUBuffer (vocab logits)
                 struct { uint32_t M, N, K; } constants;
                 constants.M = 1;
-                if (lmHeadTensor.Shape.size() >= 2) {
-                    constants.N = (uint32_t)lmHeadTensor.Shape[0];
-                    constants.K = (uint32_t)lmHeadTensor.Shape[1];
+                if (lmHeadTensor->Shape.size() >= 2) {
+                    constants.N = (uint32_t)lmHeadTensor->Shape[0];
+                    constants.K = (uint32_t)lmHeadTensor->Shape[1];
                 } else {
                     constants.N = (uint32_t)vocab;
                     constants.K = (uint32_t)hidden;
@@ -816,10 +838,10 @@ namespace DirectLLM {
                 m_inferCmdList->SetComputeRootSignature(m_gemmRootSignature.Get());
                 m_inferCmdList->SetPipelineState(m_gemmPSO.Get());
                 m_inferCmdList->SetComputeRoot32BitConstants(0, 3, &constants, 0);
-                if (m_xGPUBuffer)            m_inferCmdList->SetComputeRootShaderResourceView(1, m_xGPUBuffer->GetGPUVirtualAddress());
-                if (lmHeadTensor.GPUResource) m_inferCmdList->SetComputeRootShaderResourceView(2, lmHeadTensor.GPUResource->GetGPUVirtualAddress());
-                auto scales = lmHeadTensor.GPUScales ? lmHeadTensor.GPUScales : lmHeadTensor.GPUResource;
-                auto zeros  = lmHeadTensor.GPUZeroPoints ? lmHeadTensor.GPUZeroPoints : lmHeadTensor.GPUResource;
+                if (m_xGPUBuffer)             m_inferCmdList->SetComputeRootShaderResourceView(1, m_xGPUBuffer->GetGPUVirtualAddress());
+                if (lmHeadTensor->GPUResource) m_inferCmdList->SetComputeRootShaderResourceView(2, lmHeadTensor->GPUResource->GetGPUVirtualAddress());
+                auto scales = lmHeadTensor->GPUScales ? lmHeadTensor->GPUScales : lmHeadTensor->GPUResource;
+                auto zeros  = lmHeadTensor->GPUZeroPoints ? lmHeadTensor->GPUZeroPoints : lmHeadTensor->GPUResource;
                 if (scales) m_inferCmdList->SetComputeRootShaderResourceView(3, scales->GetGPUVirtualAddress());
                 if (zeros)  m_inferCmdList->SetComputeRootShaderResourceView(4, zeros->GetGPUVirtualAddress());
                 if (m_yGPUBuffer) m_inferCmdList->SetComputeRootUnorderedAccessView(5, m_yGPUBuffer->GetGPUVirtualAddress());
@@ -881,13 +903,13 @@ namespace DirectLLM {
             // ----------------------------------------------------------------
             //  CPU fallback — lm_head is in system RAM.
             // ----------------------------------------------------------------
-            if (!lmHeadTensor.CPUHostData.empty()) {
+            if (lmHeadTensor && !lmHeadTensor->GPUResource && !lmHeadTensor->CPUHostData.empty()) {
                 outLogits.assign(vocab, 0.0f);
                 int nThreads = std::max(1, m_cpuThreadCount);
                 int chunk    = (vocab + nThreads - 1) / nThreads;
 
-                if (lmHeadTensor.QuantType == QuantizationType::None_FP32) {
-                    const float* W = reinterpret_cast<const float*>(lmHeadTensor.CPUHostData.data());
+                if (lmHeadTensor->QuantType == QuantizationType::None_FP32) {
+                    const float* W = reinterpret_cast<const float*>(lmHeadTensor->CPUHostData.data());
                     auto worker = [&](int jStart, int jEnd) {
                         for (int j = jStart; j < jEnd; j++) {
                             outLogits[j] = DotProductSIMD(x.data(), W + (size_t)j * hidden, hidden);
@@ -906,8 +928,8 @@ namespace DirectLLM {
                         }
                         for (auto& th : threads) th.join();
                     }
-                } else if (lmHeadTensor.QuantType == QuantizationType::None_FP16) {
-                    const uint16_t* W = reinterpret_cast<const uint16_t*>(lmHeadTensor.CPUHostData.data());
+                } else if (lmHeadTensor->QuantType == QuantizationType::None_FP16) {
+                    const uint16_t* W = reinterpret_cast<const uint16_t*>(lmHeadTensor->CPUHostData.data());
                     auto worker = [&](int jStart, int jEnd) {
                         std::vector<float> row(hidden);
                         for (int j = jStart; j < jEnd; j++) {
@@ -929,8 +951,8 @@ namespace DirectLLM {
                         }
                         for (auto& th : threads) th.join();
                     }
-                } else if (lmHeadTensor.QuantType == QuantizationType::Q8_0) {
-                    const uint8_t* basePtr = lmHeadTensor.CPUHostData.data();
+                } else if (lmHeadTensor->QuantType == QuantizationType::Q8_0) {
+                    const uint8_t* basePtr = lmHeadTensor->CPUHostData.data();
                     size_t blockSizeBytes = 34;
                     size_t blocksPerRow = (size_t)hidden / 32;
                     size_t rowBytes = blocksPerRow * blockSizeBytes;
@@ -946,6 +968,41 @@ namespace DirectLLM {
                                 const int8_t* qs = reinterpret_cast<const int8_t*>(blockPtr + 2);
                                 for (size_t i = 0; i < 32; ++i) {
                                     row[b * 32 + i] = qs[i] * d;
+                                }
+                            }
+                            outLogits[j] = DotProductSIMD(x.data(), row.data(), hidden);
+                        }
+                    };
+                    if (nThreads == 1) {
+                        worker(0, vocab);
+                    } else {
+                        std::vector<std::thread> threads;
+                        threads.reserve(nThreads);
+                        for (int t = 0; t < nThreads; t++) {
+                            int jStart = t * chunk;
+                            int jEnd   = std::min(jStart + chunk, vocab);
+                            if (jStart < jEnd)
+                                threads.emplace_back(worker, jStart, jEnd);
+                        }
+                        for (auto& th : threads) th.join();
+                    }
+                } else if (lmHeadTensor->QuantType == QuantizationType::Q4_0) {
+                    const uint8_t* basePtr = lmHeadTensor->CPUHostData.data();
+                    size_t blocksPerCol = (size_t)hidden / 32;
+                    auto worker = [&](int jStart, int jEnd) {
+                        std::vector<float> row(hidden);
+                        for (int j = jStart; j < jEnd; j++) {
+                            const uint8_t* rowPtr = basePtr + (size_t)j * blocksPerCol * 18;
+                            for (int b = 0; b < blocksPerCol; ++b) {
+                                const uint8_t* blockPtr = rowPtr + b * 18;
+                                uint16_t scale_raw;
+                                std::memcpy(&scale_raw, blockPtr, 2);
+                                float scale = FP16ToFloat(scale_raw);
+                                const uint8_t* qs = blockPtr + 2;
+                                for (int i = 0; i < 32; ++i) {
+                                    uint8_t byte = qs[i / 2];
+                                    int8_t nibble = (i % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+                                    row[b * 32 + i] = (float)nibble * scale;
                                 }
                             }
                             outLogits[j] = DotProductSIMD(x.data(), row.data(), hidden);
@@ -1022,14 +1079,113 @@ namespace DirectLLM {
         return true;
     }
 
-    bool ModelPipeline::DispatchCPUMatrixMultiply(const Tensor& X, const Tensor& W, Tensor& Y) {
-        m_cpuDispatchedOperators++; return true;
+bool ModelPipeline::DispatchCPUMatrixMultiply(const Tensor& X, const Tensor& W, Tensor& Y) {
+        if (W.CPUHostData.empty() || X.CPUHostData.empty()) return false;
+        
+        size_t M = X.Shape.empty() ? 1 : X.Shape[0];
+        size_t N = W.Shape.size() >= 2 ? W.Shape[0] : 4096;
+        size_t K = W.Shape.size() >= 2 ? W.Shape[1] : 4096;
+        
+        Y.Shape = {N, M};
+        Y.CPUHostData.resize(N * M * sizeof(float));
+        float* yOut = reinterpret_cast<float*>(Y.CPUHostData.data());
+        
+        int nThreads = std::max(1, m_cpuThreadCount);
+        int chunk = (N + nThreads - 1) / nThreads;
+        
+        auto worker = [&](int jStart, int jEnd) {
+            std::vector<float> wRow(K);
+            for (int j = jStart; j < jEnd; j++) {
+                if (W.QuantType == QuantizationType::None_FP32) {
+                    const float* wPtr = reinterpret_cast<const float*>(W.CPUHostData.data());
+                    for (int k = 0; k < K; k++) wRow[k] = wPtr[j * K + k];
+                } else if (W.QuantType == QuantizationType::None_FP16) {
+                    const uint16_t* wPtr = reinterpret_cast<const uint16_t*>(W.CPUHostData.data());
+                    for (int k = 0; k < K; k++) wRow[k] = FP16ToFloat(wPtr[j * K + k]);
+                } else if (W.QuantType == QuantizationType::Q8_0) {
+                    size_t blocksPerRow = K / 32;
+                    const uint8_t* rowPtr = W.CPUHostData.data() + j * blocksPerRow * 34;
+                    for (int b = 0; b < blocksPerRow; b++) {
+                        const uint8_t* blockPtr = rowPtr + b * 34;
+                        uint16_t d_raw;
+                        std::memcpy(&d_raw, blockPtr, 2);
+                        float d = FP16ToFloat(d_raw);
+                        const int8_t* qs = reinterpret_cast<const int8_t*>(blockPtr + 2);
+                        for (int k = 0; k < 32; k++) wRow[b * 32 + k] = qs[k] * d;
+                    }
+                } else if (W.QuantType == QuantizationType::Q4_0) {
+                    size_t blocksPerRow = K / 32;
+                    const uint8_t* rowPtr = W.CPUHostData.data() + j * blocksPerRow * 18;
+                    for (int b = 0; b < blocksPerRow; b++) {
+                        const uint8_t* blockPtr = rowPtr + b * 18;
+                        uint16_t scale_raw;
+                        std::memcpy(&scale_raw, blockPtr, 2);
+                        float scale = FP16ToFloat(scale_raw);
+                        const uint8_t* qs = blockPtr + 2;
+                        for (int k = 0; k < 32; k++) {
+                            uint8_t byte = qs[k / 2];
+                            int8_t nibble = (k % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+                            wRow[b * 32 + k] = (float)nibble * scale;
+                        }
+                    }
+                } else if (W.QuantType == QuantizationType::Q4_K) {
+                    // Q4_K block format: 32 weights per block, variable layout
+                    // For simplicity, treat as raw float (placeholder - needs full implementation)
+                    const float* wPtr = reinterpret_cast<const float*>(W.CPUHostData.data());
+                    for (int k = 0; k < K; k++) wRow[k] = wPtr[j * K + k];
+                } else if (W.QuantType == QuantizationType::Q5_K) {
+                    // Q5_K: 5-bit quantization - treat as raw (placeholder)
+                    const float* wPtr = reinterpret_cast<const float*>(W.CPUHostData.data());
+                    for (int k = 0; k < K; k++) wRow[k] = wPtr[j * K + k];
+                } else if (W.QuantType == QuantizationType::Q6_K) {
+                    // Q6_K: 6-bit quantization - treat as raw (placeholder)
+                    const float* wPtr = reinterpret_cast<const float*>(W.CPUHostData.data());
+                    for (int k = 0; k < K; k++) wRow[k] = wPtr[j * K + k];
+                } else {
+                    // Fallback for Q4_0 and other types - treat as raw
+                    const float* wPtr = reinterpret_cast<const float*>(W.CPUHostData.data());
+                    for (int k = 0; k < K; k++) wRow[k] = wPtr[j * K + k];
+                }
+                yOut[j] = DotProductSIMD(reinterpret_cast<const float*>(X.CPUHostData.data()), wRow.data(), (int)K);
+            }
+        };
+        
+        m_cpuDispatchedOperators++;
+        if (nThreads == 1) {
+            worker(0, N);
+        } else {
+            std::vector<std::thread> threads;
+            for (int t = 0; t < nThreads; t++) {
+                int jStart = t * chunk;
+                int jEnd = std::min(jStart + chunk, (int)N);
+                if (jStart < jEnd) threads.emplace_back(worker, jStart, jEnd);
+            }
+            for (auto& th : threads) th.join();
+        }
+        return true;
     }
 
     bool ModelPipeline::DispatchMoERouting(const Tensor& X, const TransformerLayer& layer,
-                                            std::vector<float>& expertWeights,
-                                            std::vector<std::vector<uint32_t>>& expertTokens) {
-        m_gpuDispatchedOperators++; return true;
+                                             std::vector<float>& expertWeights,
+                                             std::vector<std::vector<uint32_t>>& expertTokens) {
+        // MoE routing: compute gate scores and assign tokens to experts
+        if (layer.MoE_Gate.CPUHostData.empty() && layer.MoE_Gate.GPUResource == nullptr) {
+            return false;
+        }
+        
+        expertWeights.assign(layer.Experts.size(), 0.0f);
+        expertTokens.clear();
+        expertTokens.resize(layer.Experts.size());
+        
+        // For now, assign to first expert (simplified routing)
+        // Full implementation would use softmax over gate weights
+        if (!layer.Experts.empty()) {
+            expertTokens[0].push_back(0); // token 0 -> expert 0
+            expertWeights[0] = 1.0f;
+        }
+        
+        m_gpuDispatchedOperators++;
+        return true;
     }
 
     float ModelPipeline::GetGpuExecutionRatio() const {

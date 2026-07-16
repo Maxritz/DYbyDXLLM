@@ -13,7 +13,7 @@ struct GEMMConstants {
 
 ConstantBuffer<GEMMConstants> config : register(b0);
 
-// FP32 activations — matches what ModelPipeline uploads from CPU embedding lookup
+// FP32 activations - matches what ModelPipeline uploads from CPU embedding lookup
 StructuredBuffer<float> InputX : register(t0);
 
 // INT4 packed weights (2 weights per byte, 8 per uint)

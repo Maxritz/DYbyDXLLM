@@ -101,13 +101,13 @@ namespace DirectLLM {
         // 2. MOE ROUTING PIPELINE
         {
             D3D12_ROOT_PARAMETER rootParams[5] = {};
-            // CBV (moeConfig)
+            // CBV (moeConst) - matches HLSL register(b1)
             rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
             rootParams[0].Constants.ShaderRegister = 1;
             rootParams[0].Constants.Num32BitValues = 4;
             rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-            // SRVs (HiddenStates, GateWeights)
+            // SRVs (HiddenStates, GateWeights) - matches HLSL registers(t3,t4)
             rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
             rootParams[1].Descriptor.ShaderRegister = 3;
             rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -116,7 +116,7 @@ namespace DirectLLM {
             rootParams[2].Descriptor.ShaderRegister = 4;
             rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-            // UAVs (ExpertIds, ExpertWeights)
+            // UAVs (ExpertIds, ExpertWeights) - matches HLSL registers(u1,u2)
             rootParams[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
             rootParams[3].Descriptor.ShaderRegister = 1;
             rootParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -143,21 +143,28 @@ namespace DirectLLM {
         // 3. TURBO QUANT DEQUANT PIPELINE
         {
             D3D12_ROOT_PARAMETER rootParams[5] = {};
-            // CBV (tqConst)
+            // CBV (tqConst) - matches HLSL register(b2)
             rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
             rootParams[0].Constants.ShaderRegister = 2;
             rootParams[0].Constants.Num32BitValues = 3;
             rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-            // SRVs (TQ_PackedWeights, TQ_Scales, TQ_ZeroPoints)
-            for (int i = 1; i <= 3; i++) {
-                rootParams[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-                rootParams[i].Descriptor.ShaderRegister = (UINT)(i + 4); // t5, t6, t7
-                rootParams[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-            }
-            // UAV (TQ_Output)
+            // SRVs (TQ_PackedWeights, TQ_Scales, TQ_ZeroPoints) - matches HLSL registers(t5,t6,t7)
+            rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rootParams[1].Descriptor.ShaderRegister = 5;
+            rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            rootParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rootParams[2].Descriptor.ShaderRegister = 6;
+            rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            rootParams[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rootParams[3].Descriptor.ShaderRegister = 7;
+            rootParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // UAV (TQ_Output) - matches HLSL register(u3)
             rootParams[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-            rootParams[4].Descriptor.ShaderRegister = 3; // u3
+            rootParams[4].Descriptor.ShaderRegister = 3;
             rootParams[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
             D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
@@ -179,14 +186,14 @@ namespace DirectLLM {
     }
 
     bool AdvancedVendorOptimizations::DispatchFusedAttention(ID3D12GraphicsCommandList* cmdList,
-                                                            ID3D12Resource* query,
-                                                            ID3D12Resource* key,
-                                                            ID3D12Resource* value,
-                                                            ID3D12Resource* output,
-                                                            uint32_t batchSize,
-                                                            uint32_t numHeads,
-                                                            uint32_t headDim,
-                                                            uint32_t seqLen) {
+                                                             ID3D12Resource* query,
+                                                             ID3D12Resource* key,
+                                                             ID3D12Resource* value,
+                                                             ID3D12Resource* output,
+                                                             uint32_t batchSize,
+                                                             uint32_t numHeads,
+                                                             uint32_t headDim,
+                                                             uint32_t seqLen) {
         if (!cmdList || !query || !key || !value || !output) return false;
         if (!m_attnPSO || !m_attnRootSignature) return false;
 
@@ -218,14 +225,14 @@ namespace DirectLLM {
     }
 
     bool AdvancedVendorOptimizations::DispatchMoEExpertLayers(ID3D12GraphicsCommandList* cmdList,
-                                                             ID3D12Resource* hiddenStates,
-                                                             ID3D12Resource* gateWeights,
-                                                             ID3D12Resource* expertIds,
-                                                             ID3D12Resource* expertWeights,
-                                                             uint32_t numTokens,
-                                                             uint32_t numExperts,
-                                                             uint32_t activeK,
-                                                             uint32_t hiddenDim) {
+                                                              ID3D12Resource* hiddenStates,
+                                                              ID3D12Resource* gateWeights,
+                                                              ID3D12Resource* expertIds,
+                                                              ID3D12Resource* expertWeights,
+                                                              uint32_t numTokens,
+                                                              uint32_t numExperts,
+                                                              uint32_t activeK,
+                                                              uint32_t hiddenDim) {
         if (!cmdList || !hiddenStates || !gateWeights || !expertIds || !expertWeights) return false;
         if (!m_moePSO || !m_moeRootSignature) return false;
 
@@ -255,13 +262,13 @@ namespace DirectLLM {
     }
 
     bool AdvancedVendorOptimizations::DispatchTurboQuantDequant(ID3D12GraphicsCommandList* cmdList,
-                                                               ID3D12Resource* packedWeights,
-                                                               ID3D12Resource* scales,
-                                                               ID3D12Resource* zeroPoints,
-                                                               ID3D12Resource* output,
-                                                               uint32_t numRows,
-                                                               uint32_t numCols,
-                                                               uint32_t groupSize) {
+                                                                ID3D12Resource* packedWeights,
+                                                                ID3D12Resource* scales,
+                                                                ID3D12Resource* zeroPoints,
+                                                                ID3D12Resource* output,
+                                                                uint32_t numRows,
+                                                                uint32_t numCols,
+                                                                uint32_t groupSize) {
         if (!cmdList || !packedWeights || !scales || !zeroPoints || !output) return false;
         if (!m_tqPSO || !m_tqRootSignature) return false;
 
