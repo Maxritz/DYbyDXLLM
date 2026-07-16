@@ -319,5 +319,5 @@ extern "C" {
     }
     __declspec(dllexport) const UINT D3D12SDKVersion = 611;
     __declspec(dllexport) const char* D3D12SDKPath =
-        "C:\\Users\\rina0423\\Desktop\\DX\\agility-latest\\build\\native\\bin\\x64\\";
+        "./agility-sdk/bin/x64/";
 }
