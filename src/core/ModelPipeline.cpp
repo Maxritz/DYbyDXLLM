@@ -858,7 +858,7 @@ std::cout << "[ModelPipeline] Loaded " << (uint64_t)m_weightTensors.size() << " 
                         for (size_t j = 0; j < 32; ++j) {
                             uint8_t byte = qs[j / 2];
                             uint8_t nibble = (j % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
-                            x[b * 32 + j] = (float)nibble * scale;
+                            x[b * 32 + j] = ((float)nibble - 8.0f) * scale;
                         }
                     }
                 } else if (embedTensor->QuantType == QuantizationType::Q4_K) {
