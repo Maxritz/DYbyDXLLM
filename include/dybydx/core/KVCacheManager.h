@@ -61,14 +61,16 @@ namespace DirectLLM {
         // seqPos is the position within the sequence (0-indexed).
         // layerIdx selects which transformer layer's cache region this write targets -
         // each layer has an independent K/V history within the same buffer.
+        // Synchronization uses a PRIVATE fence owned by this manager: sharing a fence
+        // with other subsystems while keeping separate value counters made the fence
+        // value non-monotonic, which wedges the queue (GPU hang/TDR).
         bool WriteTokenKV(ID3D12Device*       device,
                           ID3D12CommandQueue* queue,
-                          HANDLE              fenceEvent,
-                          uint32_t            batchIdx,
-                          uint32_t            layerIdx,
-                          uint32_t            seqPos,
-                          const float*        keyData,
-                          const float*        valueData);
+                          uint32_t              batchIdx,
+                          uint32_t              layerIdx,
+                          uint32_t              seqPos,
+                          const float*          keyData,
+                          const float*          valueData);
 
     private:
         // GPU buffers (DEFAULT heap, UAV)
@@ -79,13 +81,24 @@ namespace DirectLLM {
         std::vector<uint32_t> m_sequenceLengths;
 
         KVCacheConfig m_config;
+        ID3D12Device* m_device = nullptr; // Stored for persistent resource creation
         size_t        m_bufferSizeInBytes  = 0;
         size_t        m_headStrideBytes    = 0; // bytes per (head, seqPos) slot; see GetHeadStrideBytes()
 
+        // Private members for efficient KV writes
+        ComPtr<ID3D12CommandAllocator> m_kvAlloc;
+        ComPtr<ID3D12GraphicsCommandList> m_kvCmdList;
+        ComPtr<ID3D12Resource> m_kvUploadBuffer;
+        size_t m_kvUploadBufferSize = 0;
+
+        // Private fence: this manager is the ONLY signaler, so values stay monotonic
+        ComPtr<ID3D12Fence> m_kvFence;
+        HANDLE m_kvFenceEvent = nullptr;
+        UINT64 m_kvFenceValue = 0;
+        bool   m_kvAllocUsed  = false; // RDNA4: skip allocator Reset before first submit
+
         // Helpers
         size_t BytesPerElement() const;
-        // Quantise float32 vector -> packed bytes for the configured QuantType.
-        // Returns the number of bytes written into dst.
         size_t QuantizeVector(const float* src, uint8_t* dst, uint32_t numElements) const;
     };
 }

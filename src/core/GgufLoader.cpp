@@ -31,9 +31,12 @@ namespace DirectLLM {
         switch (type) {
             case GgmlType::F32:  return elements * 4;
             case GgmlType::F16:  return elements * 2;
+            case GgmlType::BF16: return elements * 2;
+            case GgmlType::F64:  return elements * 8;
             case GgmlType::I8:   return elements;
             case GgmlType::I16:  return elements * 2;
             case GgmlType::I32:  return elements * 4;
+            case GgmlType::I64:  return elements * 8;
             case GgmlType::Q4_0: return (elements / 32) * 18;
             case GgmlType::Q4_1: return (elements / 32) * 20;
             case GgmlType::Q5_0: return (elements / 32) * 22;
@@ -46,6 +49,15 @@ namespace DirectLLM {
             case GgmlType::Q5_K: return (elements / 256) * 176;
             case GgmlType::Q6_K: return (elements / 256) * 210;
             case GgmlType::Q8_K: return (elements / 256) * 292;
+            case GgmlType::IQ2_XXS: return (elements / 256) * 66;
+            case GgmlType::IQ2_XS:  return (elements / 256) * 74;
+            case GgmlType::IQ3_XXS: return (elements / 256) * 98;
+            case GgmlType::IQ1_S:   return (elements / 256) * 50;
+            case GgmlType::IQ1_M:   return (elements / 256) * 56;
+            case GgmlType::IQ4_NL:  return (elements / 32)  * 18;
+            case GgmlType::IQ3_S:   return (elements / 256) * 110;
+            case GgmlType::IQ2_S:   return (elements / 256) * 82;
+            case GgmlType::IQ4_XS:  return (elements / 256) * 136;
             default:             return elements * 2;
         }
     }

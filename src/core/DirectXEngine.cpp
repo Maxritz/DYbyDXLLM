@@ -119,9 +119,10 @@ namespace DirectLLM {
         // Now query capabilities (needs device for feature checks)
         QueryDeviceCapabilities();
 
-        // Compute queue
+        // Compute queue — DIRECT type, not COMPUTE: on AMD RDNA4 (RX 9070 XT,
+        // driver 25.30.x) COMPUTE-type queues/lists cause spurious device removal.
         D3D12_COMMAND_QUEUE_DESC cqd = {};
-        cqd.Type     = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        cqd.Type     = D3D12_COMMAND_LIST_TYPE_DIRECT;
         cqd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
         m_device->CreateCommandQueue(&cqd, IID_PPV_ARGS(&m_computeQueue));
 

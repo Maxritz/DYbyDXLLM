@@ -5,30 +5,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_compile_definitions(NOMINMAX)
-
+add_compile_definitions(ZEN3_OPT=1)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-
-# ---------------------------------------------------------------------------
-# Compiler optimisation + SIMD flags
-# ModelPipeline.cpp does runtime CPUID dispatch for AVX-512F / AVX2 / AVX.
-# Compiling with /arch:AVX512 (MSVC) or -march=native (GCC/Clang) makes all
-# intrinsic headers available; the runtime check ensures correctness on
-# machines that don't support every level.
-# ---------------------------------------------------------------------------
-if(MSVC)
-    add_compile_options(
-        /O2           # Full optimisation
-        /Oi           # Intrinsic functions
-        /Ot           # Favour speed over size
-        /fp:fast      # Fast floating-point (allows reassociation, reciprocals)
-        /arch:AVX2    # Enable AVX2 intrinsic headers
-                      # Actual AVX2 code is runtime-gated via CPUID + XCR0
-    )
-else()
-    add_compile_options(-O3 -march=native -ffast-math)
-endif()
 
 set(SOURCES
     src/core/DirectXEngine.cpp
@@ -41,11 +21,43 @@ set(SOURCES
     src/core/GgufLoader.cpp
 )
 
-set(DIRECTSTORAGE_DIR "C:/Users/rina0423/Desktop/DX/directstorage")
-set(DXC_DIR "C:/Users/rina0423/Desktop/DX/DXcompiler")
-set(OPENVINO_DIR "C:/Users/rina0423/Desktop/DX/openvino/runtime")
+set(DIRECTSTORAGE_DIR "C:/Users/rr/Desktop/dxxxx/ds14")
+set(DXC_DIR "C:/Users/rr/Desktop/dxxxx/dxc-1.10.2605.2")
+set(OPENVINO_DIR "C:/Users/rr/Desktop/dxxxx/OpenVINO/runtime")
 
-# OpenVINO SDK paths
+# Check if SDKs exist
+if(EXISTS "${DIRECTSTORAGE_DIR}/native/include/dstorage.h")
+    set(HAVE_DIRECTSTORAGE TRUE)
+else()
+    set(HAVE_DIRECTSTORAGE FALSE)
+    message(WARNING "DirectStorage not found - building without DirectStorage")
+endif()
+if(EXISTS "${DXC_DIR}/inc/dxcapi.h")
+    set(HAVE_DXC TRUE)
+else()
+    set(HAVE_DXC FALSE)
+    message(WARNING "DXC not found - building without DXC shader compilation")
+endif()
+if(EXISTS "${OPENVINO_DIR}/include/openvino.hpp")
+    set(HAVE_OPENVINO TRUE)
+else()
+    set(HAVE_OPENVINO FALSE)
+    message(WARNING "OpenVINO not found - building without OpenVINO")
+endif()
+
+# Compiler optimisation + SIMD flags
+if(MSVC)
+    add_compile_options(
+        /O2           # Full optimisation
+        /Oi           # Intrinsic functions
+        /Ot           # Favour speed over size
+        /fp:fast      # Fast floating-point
+        /arch:AVX2    # Enable AVX2 intrinsic headers
+    )
+else()
+    add_compile_options(-O3 -march=native -ffast-math)
+endif()
+
 set(OPENVINO_INCLUDE_DIR "${OPENVINO_DIR}/include")
 set(OPENVINO_LIB_DIR "${OPENVINO_DIR}/lib/intel64/Release")
 
@@ -53,32 +65,61 @@ set(OPENVINO_LIB_DIR "${OPENVINO_DIR}/lib/intel64/Release")
 add_library(DirectLLM.Core SHARED ${SOURCES})
 target_include_directories(DirectLLM.Core PRIVATE
     include
-    ${DIRECTSTORAGE_DIR}/native/include
-    ${DXC_DIR}/inc
-    ${OPENVINO_INCLUDE_DIR}
 )
-target_link_directories(DirectLLM.Core PRIVATE
-    ${DIRECTSTORAGE_DIR}/native/lib/x64
-    ${DXC_DIR}/lib/x64
-    ${OPENVINO_LIB_DIR}
-)
-target_link_libraries(DirectLLM.Core PRIVATE d3d12 dxgi d3dcompiler dstorage dxcompiler openvino)
+if(HAVE_OPENVINO)
+    target_include_directories(DirectLLM.Core PRIVATE ${OPENVINO_INCLUDE_DIR})
+endif()
+if(HAVE_DIRECTSTORAGE)
+    target_include_directories(DirectLLM.Core PRIVATE ${DIRECTSTORAGE_DIR}/native/include)
+endif()
+if(HAVE_DXC)
+    target_include_directories(DirectLLM.Core PRIVATE ${DXC_DIR}/inc)
+endif()
+if(HAVE_OPENVINO)
+    target_link_directories(DirectLLM.Core PRIVATE ${OPENVINO_LIB_DIR})
+endif()
+if(HAVE_DIRECTSTORAGE)
+    target_link_directories(DirectLLM.Core PRIVATE ${DIRECTSTORAGE_DIR}/native/lib/x64)
+endif()
+if(HAVE_DXC)
+    target_link_directories(DirectLLM.Core PRIVATE ${DXC_DIR}/lib/x64)
+endif()
+
+set(LINK_LIBS d3d12 dxgi d3dcompiler dxcompiler)
+if(HAVE_OPENVINO)
+    list(APPEND LINK_LIBS openvino)
+endif()
+target_link_libraries(DirectLLM.Core PRIVATE ${LINK_LIBS})
+if(HAVE_DIRECTSTORAGE)
+    target_link_libraries(DirectLLM.Core PRIVATE dstorage)
+endif()
 
 add_executable(DybyDx cli/main.cpp ${SOURCES})
-target_include_directories(DybyDx PRIVATE
-    include
-    ${DIRECTSTORAGE_DIR}/native/include
-    ${DXC_DIR}/inc
-    ${OPENVINO_INCLUDE_DIR}
-)
-target_link_directories(DybyDx PRIVATE
-    ${DIRECTSTORAGE_DIR}/native/lib/x64
-    ${DXC_DIR}/lib/x64
-    ${OPENVINO_LIB_DIR}
-)
-target_link_libraries(DybyDx PRIVATE d3d12 dxgi d3dcompiler dstorage dxcompiler openvino)
+target_include_directories(DybyDx PRIVATE include)
+if(HAVE_OPENVINO)
+    target_include_directories(DybyDx PRIVATE ${OPENVINO_INCLUDE_DIR})
+endif()
+if(HAVE_DIRECTSTORAGE)
+    target_include_directories(DybyDx PRIVATE ${DIRECTSTORAGE_DIR}/native/include)
+endif()
+if(HAVE_DXC)
+    target_include_directories(DybyDx PRIVATE ${DXC_DIR}/inc)
+endif()
+if(HAVE_OPENVINO)
+    target_link_directories(DybyDx PRIVATE ${OPENVINO_LIB_DIR})
+endif()
+if(HAVE_DIRECTSTORAGE)
+    target_link_directories(DybyDx PRIVATE ${DIRECTSTORAGE_DIR}/native/lib/x64)
+endif()
+if(HAVE_DXC)
+    target_link_directories(DybyDx PRIVATE ${DXC_DIR}/lib/x64)
+endif()
+target_link_libraries(DybyDx PRIVATE ${LINK_LIBS})
+if(HAVE_DIRECTSTORAGE)
+    target_link_libraries(DybyDx PRIVATE dstorage)
+endif()
 
-# Post-build: copy shaders, DirectStorage, and OpenVINO DLLs
+# Post-build: copy shaders
 foreach(TGT DirectLLM.Core DybyDx)
     add_custom_command(TARGET ${TGT} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -86,29 +127,34 @@ foreach(TGT DirectLLM.Core DybyDx)
             "$<TARGET_FILE_DIR:${TGT}>/shaders"
         COMMENT "Copying HLSL shaders to ${TGT} output..."
     )
+    if(HAVE_DIRECTSTORAGE)
+        add_custom_command(TARGET ${TGT} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${DIRECTSTORAGE_DIR}/native/bin/x64/dstorage.dll"
+                "$<TARGET_FILE_DIR:${TGT}>/dstorage.dll"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${DIRECTSTORAGE_DIR}/native/bin/x64/dstoragecore.dll"
+                "$<TARGET_FILE_DIR:${TGT}>/dstoragecore.dll"
+            COMMENT "Copying DirectStorage runtime DLLs to ${TGT}..."
+        )
+    endif()
+    if(HAVE_DXC)
+        add_custom_command(TARGET ${TGT} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${DXC_DIR}/bin/x64/dxcompiler.dll"
+                "$<TARGET_FILE_DIR:${TGT}>/dxcompiler.dll"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${DXC_DIR}/bin/x64/dxil.dll"
+                "$<TARGET_FILE_DIR:${TGT}>/dxil.dll"
+            COMMENT "Copying DXC compiler DLLs to ${TGT}..."
+        )
+    endif()
+    # Copy DirectX 12 SDK layers for graphics debugging
     add_custom_command(TARGET ${TGT} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${DIRECTSTORAGE_DIR}/native/bin/x64/dstorage.dll"
-            "$<TARGET_FILE_DIR:${TGT}>/dstorage.dll"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${DIRECTSTORAGE_DIR}/native/bin/x64/dstoragecore.dll"
-            "$<TARGET_FILE_DIR:${TGT}>/dstoragecore.dll"
-        COMMENT "Copying DirectStorage runtime DLLs to ${TGT}..."
-    )
-    add_custom_command(TARGET ${TGT} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${DXC_DIR}/bin/x64/dxcompiler.dll"
-            "$<TARGET_FILE_DIR:${TGT}>/dxcompiler.dll"
-        COMMENT "Copying DXC compiler DLL to ${TGT}..."
-    )
-    add_custom_command(TARGET ${TGT} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "C:/Users/rina0423/Desktop/DX/openvino/runtime/bin/intel64/Release"
-            "$<TARGET_FILE_DIR:${TGT}>"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "C:/Users/rina0423/Desktop/DX/openvino/runtime/3rdparty/tbb/bin/tbb12.dll"
-            "$<TARGET_FILE_DIR:${TGT}>/tbb12.dll"
-        COMMENT "Copying OpenVINO runtime DLLs and TBB to ${TGT}..."
+            "${CMAKE_SOURCE_DIR}/../sdk/build/native/bin/x64/d3d12SDKLayers.dll"
+            "$<TARGET_FILE_DIR:${TGT}>/d3d12SDKLayers.dll"
+        COMMENT "Copying D3D12 SDK Layers to ${TGT}..."
     )
 endforeach()
 

@@ -40,5 +40,18 @@ namespace DirectLLM {
         std::unordered_map<std::string, int32_t> m_encoder;
         std::unordered_map<int32_t, std::string> m_decoder;
         std::unordered_map<std::string, int64_t> m_bpeRanks;
+
+        // Tokenizer flavor from tokenizer.ggml.model:
+        //  "gpt2"  -> byte-level BPE (llama3, qwen, minicpm): vocab strings are
+        //             GPT-2 byte-encoded; raw text must be mapped before greedy
+        //             matching and mapped back on decode.
+        //  "llama" -> SentencePiece: spaces are U+2581 (▁).
+        bool m_byteLevel = false;
+        bool m_spm = false;
+        bool m_addBos = true;
+        std::string m_chatTemplate; // tokenizer.chat_template if present
+
+        std::string ByteEncode(const std::string& raw) const;   // raw bytes -> gpt2 unicode
+        std::string ByteDecode(const std::string& mapped) const; // gpt2 unicode -> raw bytes
     };
 }

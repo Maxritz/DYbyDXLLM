@@ -44,7 +44,10 @@ namespace DirectLLM {
         Q5_K,             // 5-bit block-quantized weights (modern)
         Q6_K,             // 6-bit block-quantized weights
         Q8_0,             // 8-bit block-quantized weights (legacy)
-        Q8_K              // 8-bit block-quantized weights (modern)
+        Q8_K,             // 8-bit block-quantized weights (modern)
+        BF16,             // bfloat16
+        IQ4_NL,           // 4-bit non-linear (32/block)
+        IQ4_XS            // 4-bit non-linear super-block (256/block)
     };
 
     enum class DeviceLocation {
@@ -77,8 +80,12 @@ namespace DirectLLM {
         size_t HiddenDim = 4096;
         size_t IntermediateDim = 11008;
         size_t NumHeads = 32;
+        size_t NumKVHeads = 0;    // GQA; 0 = same as NumHeads (MHA)
         size_t HeadDim = 128;
         size_t VocabSize = 32000;
+        float  RopeFreqBase = 10000.0f;
+        float  RmsNormEps = 1e-5f;
+        bool   RopeNeox = false;  // true: rotate (i, i+half); false: adjacent pairs
         
         QuantizationType WeightQuantType = QuantizationType::Q4_K;
         KVCacheQuantType CacheQuantType = KVCacheQuantType::None_FP16;
@@ -88,28 +95,38 @@ namespace DirectLLM {
         
         float VramAllocationLimitMB = 6000.0f;
         bool EnableSystemRamOffload = true;
-
-        bool ForceStreamMode     = false;
+        bool ForceCpuOnly = false;
         bool UseMetadataOnlyLoad = false;
+        bool ForceStreamMode = false;
     };
 
-    struct TransformerLayer {
+struct TransformerLayer {
         size_t LayerIndex;
         DeviceLocation PrimaryLocation;
-        
-        // Attention weights
-        Tensor QKV_Proj;  // QKV combined projection
-        Tensor O_Proj;    // Output projection
-        
+
+        // Attention weights - support both fused QKV and separate Q/K/V
+        Tensor QKV_Proj;
+        Tensor Q_Proj;  // Separate Q projection (Llama 3.2 style)
+        Tensor K_Proj;  // Separate K projection (Llama 3.2 style)
+        Tensor V_Proj;  // Separate V projection (Llama 3.2 style)
+        Tensor O_Proj;  // Output projection
+
+        // Optional per-projection biases (Qwen2) and Q/K head norms (Qwen3)
+        Tensor Q_Bias;
+        Tensor K_Bias;
+        Tensor V_Bias;
+        Tensor Attn_Q_Norm;
+        Tensor Attn_K_Norm;
+
         // RMSNorm weights
         Tensor Attn_Norm;    // Attention layer norm
         Tensor FFN_Norm;    // FFN layer norm
-        
+
         // FFN weights (for non-MoE models)
         Tensor FFN_Gate_Proj;
         Tensor FFN_Up_Proj;
         Tensor FFN_Down_Proj;
-        
+
         // MoE weights
         Tensor MoE_Gate;
         std::vector<Tensor> Experts;
@@ -204,6 +221,7 @@ ComPtr<ID3D12CommandAllocator> m_cmdAllocator;
         ComPtr<ID3D12Fence> m_inferFence;
         UINT64 m_inferFenceValue = 0;
         HANDLE m_inferFenceEvent = nullptr;
+        bool m_inferAllocUsed = false; // RDNA4: skip allocator Reset before first submit
 
         bool BuildGEMMPipeline();
         bool BuildFlashAttentionPipeline();
@@ -218,5 +236,24 @@ ComPtr<ID3D12CommandAllocator> m_cmdAllocator;
                                         std::vector<float>& out, int seqLen, int nHeads, int headDim, uint32_t layerIdx);
         bool DispatchGPUFlashAttention(const std::vector<float>& Q, const std::vector<float>& K, const std::vector<float>& V,
                                         std::vector<float>& out, int seqLen, int nHeads, int headDim, uint32_t layerIdx);
+
+        // CPU weights cache for Zen3 GEMM
+        std::vector<float> m_cpuWeightsCacheFloat;
+        size_t m_cpuWeightsCacheN = 0;
+        size_t m_cpuWeightsCacheK = 0;
+        std::string m_cpuWeightsCacheKey;
+        bool m_cpuWeightsCacheValid = false;
+
+        // CPU-side KV cache: [layer] -> seqLen * (NumKVHeads * HeadDim) floats.
+        // The CPU forward pass keeps its own K/V history; the GPU KVCacheManager
+        // is only used by GPU attention paths.
+        std::vector<std::vector<float>> m_cpuKCache;
+        std::vector<std::vector<float>> m_cpuVCache;
+        uint32_t m_cpuSeqLen = 0;
+
+        // Unified quant support: dequantize row `rowIdx` (length rowLen) of W into out
+        bool DequantRow(const Tensor& W, size_t rowIdx, size_t rowLen, float* out) const;
+        // y[0..N) = W(N x K) * x[0..K), multithreaded, any supported quant
+        bool MatVec(const Tensor& W, const float* x, float* y, size_t N, size_t K) const;
     };
 }

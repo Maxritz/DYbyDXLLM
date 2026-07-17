@@ -19,6 +19,7 @@ using namespace DirectLLM;
 struct CliOptions {
     bool debug = false;
     bool verbose = false;
+    bool cpuOnly = false;
     std::string modelPath;
     std::string prompt = "Hello, what is DirectX 12?";
     int nPredict = 64;
@@ -66,6 +67,7 @@ static void printHelp() {
     std::cout << "  --vram-limit <MB>        VRAM allocation limit in MB (default 2048)" << std::endl;
     std::cout << "  --force-stream           Force streaming decode even on dense models" << std::endl;
     std::cout << "  --metadata-only          Skip weight loading; read GGUF metadata only (for 100 GB+ models)" << std::endl;
+    std::cout << "  --cpu-only               Force CPU-only inference (no GPU required)" << std::endl;
     std::cout << "  -verbose                 Detailed tracing" << std::endl;
     std::cout << "  -h, --help               This help" << std::endl;
 }
@@ -90,6 +92,7 @@ static CliOptions parseArgs(int argc, char* argv[]) {
         else if (arg == "--vram-limit" && i + 1 < argc) opts.vramLimit = std::stof(argv[++i]);
         else if (arg == "--force-stream") opts.forceStream = true;
         else if (arg == "--metadata-only") opts.metadataOnly = true;
+        else if (arg == "--cpu-only") opts.cpuOnly = true;
         else if (arg == "--output" && i + 1 < argc) opts.outputPath = argv[++i];
     }
     return opts;
@@ -215,6 +218,7 @@ int main(int argc, char* argv[]) {
     config.VramAllocationLimitMB = opts.vramLimit;
     config.ForceStreamMode = opts.forceStream;
     config.UseMetadataOnlyLoad = opts.metadataOnly;
+    config.ForceCpuOnly = opts.cpuOnly;
 
     if (modelLoaded) {
         if (ggufLoader.HasMetadata("general.architecture")) {
@@ -284,12 +288,15 @@ int main(int argc, char* argv[]) {
                                     ggufLoader.GetMetadataUint32("llama.expert_used_count") : 2;
         }
 
-        // Vocab size from any embedding tensor
+        // Vocab size from any embedding tensor.
+        // GGUF stores dims in ggml ne-order: Shape[0]=hidden, Shape[1]=vocab —
+        // reading Shape[0] here capped sampling at the hidden dim (e.g. 1536)
+        // instead of the real vocab (e.g. 130560).
         for (const auto& [name, tensor] : ggufLoader.GetTensors()) {
             if (name.find("embed") != std::string::npos || name.find("tok_embeddings") != std::string::npos ||
                 name.find("output") != std::string::npos || name.find("lm_head") != std::string::npos) {
-                if (tensor.Shape.size() >= 1) {
-                    config.VocabSize = std::max(config.VocabSize, (size_t)tensor.Shape[0]);
+                if (tensor.Shape.size() >= 2) {
+                    config.VocabSize = std::max(config.VocabSize, (size_t)tensor.Shape[1]);
                 }
             }
         }
@@ -300,7 +307,9 @@ int main(int argc, char* argv[]) {
         log("Model", "WARNING: --force-stream enabled on a dense model. Generation will be slow!", "WARN");
     }
 
-    pipeline.Initialize(engineOk ? &engine : nullptr, config);
+    // --cpu-only must actually bypass the GPU: pass no engine so every path
+    // (weights, KV cache, matmuls) stays on the CPU with zero D3D12 calls.
+    pipeline.Initialize((engineOk && !opts.cpuOnly) ? &engine : nullptr, config);
     if (modelLoaded) {
         pipeline.LoadModelWeights(std::wstring(opts.modelPath.begin(), opts.modelPath.end()));
     }
@@ -314,63 +323,69 @@ int main(int argc, char* argv[]) {
     std::cout << "\n--- OUTPUT ---\n";
 
     std::vector<float> logits(config.VocabSize > 0 ? config.VocabSize : 32000);
-    std::vector<int32_t> tokens = promptTokens;
+    std::vector<int32_t> tokens;
     int genCount = 0;
 
-std::string lowerPrompt = opts.prompt;
-for (char &c : lowerPrompt) c = tolower(c);
+    // ---- Prefill: feed EVERY prompt token through the model so the KV cache
+    // holds the full prompt. (Previously only the last prompt token was ever
+    // processed — the model never saw the prompt.) Logits from the final
+    // prompt token seed generation.
+    auto prefillStart = std::chrono::high_resolution_clock::now();
+    bool ok = true;
+    for (size_t i = 0; i < promptTokens.size() && ok; ++i) {
+        tokens.push_back(promptTokens[i]);
+        ok = pipeline.RunInferenceStep(1, tokens, (uint32_t)i, logits);
+    }
+    auto prefillEnd = std::chrono::high_resolution_clock::now();
+    float prefillMs = std::chrono::duration<float, std::milli>(prefillEnd - prefillStart).count();
+    if (!ok) {
+        log("Pipeline", "Prefill failed — cannot generate.", "ERROR");
+        return 1;
+    }
+    log("Pipeline", std::to_string(promptTokens.size()) + " prompt tokens prefilled in " +
+        std::to_string((int)prefillMs) + "ms (" +
+        std::to_string(promptTokens.size() / (prefillMs / 1000.0f)) + " tok/s)");
 
     auto genStartTime = std::chrono::high_resolution_clock::now();
 
     for (int step = 0; step < opts.nPredict; step++) {
-        // Run real GPU or fallback CPU/NPU inference step
-        auto stepStart = std::chrono::high_resolution_clock::now();
-        bool ok = pipeline.RunInferenceStep(1, tokens, (uint32_t)step, logits);
-        if (!ok) break;
-
-        // Apply sampling parameter options (Temperature, Repetition Penalty, Presence Penalty) to logits
+        // Sampling: temperature, repetition penalty, presence penalty
         if (opts.temperature > 0.0f) {
-            for (float& l : logits) {
-                l /= opts.temperature;
-            }
+            for (float& l : logits) l /= opts.temperature;
         }
-
         for (int32_t tok : tokens) {
             if (tok >= 0 && tok < (int32_t)logits.size()) {
-                if (logits[tok] > 0.0f) {
-                    logits[tok] /= opts.repeatPenalty;
-                } else {
-                    logits[tok] *= opts.repeatPenalty;
-                }
+                if (logits[tok] > 0.0f) logits[tok] /= opts.repeatPenalty;
+                else                    logits[tok] *= opts.repeatPenalty;
                 logits[tok] -= opts.presencePenalty;
             }
         }
 
-        // Sample next token from logits using temperature, top-p, top-k
-        int32_t nextToken = LocalSample(logits.data(), config.VocabSize, opts.temperature, opts.topP, opts.topK);
+        int32_t nextToken = LocalSample(logits.data(), (int)logits.size(), opts.temperature, opts.topP, opts.topK);
 
-        // Stop cleanly on any EOS token
         if (tokenizer.IsEosToken(nextToken)) {
             log("Pipeline", "EOS token hit at step " + std::to_string(step) + " — stopping.");
             break;
         }
 
         std::string word = tokenizer.Decode({nextToken});
-
         genCount++;
         std::cout << word << std::flush;
         tokens.push_back(nextToken);
 
-        // Verbose detailed prints
+        // Feed the sampled token to get logits for the next step
+        auto stepStart = std::chrono::high_resolution_clock::now();
+        ok = pipeline.RunInferenceStep(1, tokens, (uint32_t)(tokens.size() - 1), logits);
+        if (!ok) break;
+
         if (opts.verbose) {
             auto stepEnd = std::chrono::high_resolution_clock::now();
             float latency = std::chrono::duration<float, std::milli>(stepEnd - stepStart).count();
             std::stringstream ss1;
             ss1 << std::fixed << std::setprecision(2) << latency;
-            log("QuantGEMM", "Token " + std::to_string(step) + " - Dispatch Compute Shader. Latency: " + ss1.str() + "ms (measured)", "TRACE");
+            log("Pipeline", "Token " + std::to_string(step) + " latency: " + ss1.str() + "ms", "TRACE");
         }
-
-        } // end inference loop
+    } // end inference loop
     std::cout << "\n" << std::endl;
 
     // Write essay to file if requested

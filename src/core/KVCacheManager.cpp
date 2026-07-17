@@ -8,34 +8,32 @@
 
 namespace DirectLLM {
 
-    // ----------------------------------------------------------------
-    //  Float16 conversion helper (software, no intrinsics needed)
-    // ----------------------------------------------------------------
-    static uint16_t FloatToFP16(float v) {
-        uint32_t bits;
-        std::memcpy(&bits, &v, 4);
-        uint32_t sign     = (bits >> 31) & 0x1;
-        int32_t  exponent = ((bits >> 23) & 0xFF) - 127;
-        uint32_t mantissa = bits & 0x7FFFFF;
+     // ----------------------------------------------------------------
+     //  Float16 conversion helper (software, no intrinsics needed)
+     // ----------------------------------------------------------------
+     static uint16_t FloatToFP16(float v) {
+         uint32_t bits;
+         std::memcpy(&bits, &v, 4);
+         uint32_t sign     = (bits >> 31) & 0x1;
+         int32_t  exponent = ((bits >> 23) & 0xFF) - 127;
+         uint32_t mantissa = bits & 0x7FFFFF;
 
-        if (exponent > 15)  return (uint16_t)((sign << 15) | 0x7C00); // inf
-        if (exponent < -14) return (uint16_t)(sign << 15);             // underflow -> 0
+         if (exponent > 15)  return (uint16_t)((sign << 15) | 0x7C00); // inf
+         if (exponent < -14) return (uint16_t)(sign << 15);             // underflow -> 0
 
-        uint16_t h_exp = (uint16_t)(exponent + 15) << 10;
-        uint16_t h_man = (uint16_t)(mantissa >> 13);
-        return (uint16_t)((sign << 15) | h_exp | h_man);
-    }
+         uint16_t h_exp = (uint16_t)(exponent + 15) << 10;
+         uint16_t h_man = (uint16_t)(mantissa >> 13);
+         return (uint16_t)((sign << 15) | h_exp | h_man);
+     }
 
-    // Very simple FP8 (E4M3) approximation via scale-and-clamp
-    static uint8_t FloatToFP8(float v) {
-        // Scale to [-448, 448] range of E4M3, clamp, then quantize to 8-bit
-        float scaled = std::fmax(-448.f, std::fmin(448.f, v));
-        // Map to [0,255]: 0 = -448, 128 = 0, 255 = +447
-        return (uint8_t)std::fmax(0.f, std::fmin(255.f, (scaled / 448.f + 1.f) * 127.5f));
-    }
+     // Very simple FP8 (E4M3) approximation via scale-and-clamp
+     static uint8_t FloatToFP8(float v) {
+         float scaled = std::fmax(-448.f, std::fmin(448.f, v));
+         return (uint8_t)std::fmax(0.f, std::fmin(255.f, (scaled / 448.f + 1.f) * 127.5f));
+     }
 
     // ----------------------------------------------------------------
-    KVCacheManager::KVCacheManager() { m_config = {}; }
+    KVCacheManager::KVCacheManager() : m_kvUploadBufferSize(0) {}
     KVCacheManager::~KVCacheManager() { Reset(); }
 
     size_t KVCacheManager::BytesPerElement() const {
@@ -50,7 +48,14 @@ namespace DirectLLM {
     }
 
     bool KVCacheManager::Initialize(ID3D12Device* device, const KVCacheConfig& config) {
+        if (!device) {
+            std::cerr << "[KVCache] Warning: No device provided - CPU-only mode" << std::endl;
+            m_config = config;
+            m_sequenceLengths.assign(config.BatchSize, 0);
+            return true;
+        }
         m_config = config;
+        m_device = device; // Store device for persistent resource creation
         m_sequenceLengths.assign(config.BatchSize, 0);
 
         // Head-major layout: each (batch, head, seqPos) slot holds one head's
@@ -111,7 +116,7 @@ namespace DirectLLM {
             IID_PPV_ARGS(&m_keyBuffer));
         if (FAILED(hr)) { std::cerr << "[KVCache] Key buffer alloc failed hr=" << std::hex << hr << std::endl; return false; }
 
-        hr = device->CreateCommittedResource(
+        hr = m_device->CreateCommittedResource(
             &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
             IID_PPV_ARGS(&m_valueBuffer));
@@ -190,7 +195,7 @@ namespace DirectLLM {
         }
     }
 
-    // ----------------------------------------------------------------
+// ----------------------------------------------------------------
     //  WriteTokenKV
     //  1. Quantize key and value float32 vectors on CPU.
     //  2. Upload quantized bytes via UPLOAD heap.
@@ -199,15 +204,18 @@ namespace DirectLLM {
     //  5. Transition back: COPY_DEST -> UAV.
     //  6. Submit and wait on fence event.
     // ----------------------------------------------------------------
-    bool KVCacheManager::WriteTokenKV(ID3D12Device*       device,
-                                       ID3D12CommandQueue* queue,
-                                       HANDLE              fenceEvent,
-                                       uint32_t            batchIdx,
-                                       uint32_t            layerIdx,
-                                       uint32_t            seqPos,
-                                       const float*        keyData,
-                                       const float*        valueData) {
-        if (!m_keyBuffer || !m_valueBuffer) return false;
+bool KVCacheManager::WriteTokenKV(ID3D12Device*       device,
+                                         ID3D12CommandQueue* queue,
+                                         uint32_t            batchIdx,
+                                         uint32_t            layerIdx,
+                                         uint32_t            seqPos,
+                                         const float*        keyData,
+                                         const float*        valueData) {
+        // Skip GPU writes in CPU-only mode (no GPU buffers)
+        if (!m_keyBuffer || !m_valueBuffer) {
+            return true; // No-op in CPU-only mode
+        }
+        if (!m_device) return false;
         if (batchIdx >= m_config.BatchSize)  return false;
         if (layerIdx >= m_config.NumLayers)  return false;
         if (seqPos   >= m_config.MaxSequenceLength) return false;
@@ -216,8 +224,42 @@ namespace DirectLLM {
         uint32_t numHeads = m_config.NumHeads;
         size_t totalBytes = (size_t)numHeads * m_headStrideBytes;
 
-        // Quantise each head's HeadDimension-length vector separately (per-head scale
-        // for INT8/INT4, matching how the attention shader reads slots independently).
+        // Private fence + event (lazy init): sole signaler = monotonic values
+        if (!m_kvFence) {
+            if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_kvFence))))
+                return false;
+            m_kvFenceValue = 0;
+        }
+        if (!m_kvFenceEvent) {
+            m_kvFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+            if (!m_kvFenceEvent) return false;
+        }
+
+        // Upload buffer holds K bytes then V bytes so one submit covers both
+        size_t uploadBytes = totalBytes * 2;
+        if (!m_kvUploadBuffer || m_kvUploadBufferSize < uploadBytes) {
+            if (m_kvUploadBuffer) m_kvUploadBuffer.Reset();
+            D3D12_HEAP_PROPERTIES uploadHeap = {};
+            uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC uploadDesc = {};
+            uploadDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+            uploadDesc.Width            = uploadBytes;
+            uploadDesc.Height           = 1;
+            uploadDesc.DepthOrArraySize = 1;
+            uploadDesc.MipLevels        = 1;
+            uploadDesc.Format           = DXGI_FORMAT_UNKNOWN;
+            uploadDesc.SampleDesc.Count = 1;
+            uploadDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            uploadDesc.Flags            = D3D12_RESOURCE_FLAG_NONE;
+
+            HRESULT hr = device->CreateCommittedResource(
+                &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_kvUploadBuffer));
+            if (FAILED(hr)) return false;
+            m_kvUploadBufferSize = uploadBytes;
+        }
+
+        // Quantise each head's HeadDimension-length vector separately (per-head scale)
         std::vector<uint8_t> quantKey(totalBytes, 0);
         std::vector<uint8_t> quantVal(totalBytes, 0);
         for (uint32_t h = 0; h < numHeads; ++h) {
@@ -227,87 +269,83 @@ namespace DirectLLM {
                             quantVal.data() + (size_t)h * m_headStrideBytes, headDim);
         }
 
-        // Allocate a temporary upload buffer large enough for all heads of one K or V write
-        D3D12_HEAP_PROPERTIES uploadHeap = {};
-        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-        D3D12_RESOURCE_DESC uploadDesc = {};
-        uploadDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
-        uploadDesc.Width            = totalBytes;
-        uploadDesc.Height           = 1;
-        uploadDesc.DepthOrArraySize = 1;
-        uploadDesc.MipLevels        = 1;
-        uploadDesc.Format           = DXGI_FORMAT_UNKNOWN;
-        uploadDesc.SampleDesc.Count = 1;
-        uploadDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        // Persistent command allocator/list
+        if (!m_kvAlloc) {
+            device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_kvAlloc));
+        }
+        if (!m_kvCmdList) {
+            device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                m_kvAlloc.Get(), nullptr, IID_PPV_ARGS(&m_kvCmdList));
+            m_kvCmdList->Close();
+        }
 
-        ComPtr<ID3D12Resource> uploadBuf;
-        HRESULT hr = device->CreateCommittedResource(
-            &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
-            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuf));
-        if (FAILED(hr)) return false;
-
-        // Helper: write all heads of one K or V vector in a single submit.
-        // Destination offsets are head-strided (non-contiguous), so this issues
-        // one CopyBufferRegion per head, but only ONE command list submit + wait
-        // per K/V write (not per head) to avoid multiplying GPU round-trips.
-        auto writeBuffer = [&](const uint8_t* quantData, ID3D12Resource* gpuBuf) -> bool {
+        // Single upload map: K bytes at offset 0, V bytes at offset totalBytes
+        {
             void* pMap = nullptr;
-            if (FAILED(uploadBuf->Map(0, nullptr, &pMap))) return false;
-            std::memcpy(pMap, quantData, totalBytes);
-            uploadBuf->Unmap(0, nullptr);
+            if (FAILED(m_kvUploadBuffer->Map(0, nullptr, &pMap))) return false;
+            std::memcpy(static_cast<uint8_t*>(pMap),              quantKey.data(), totalBytes);
+            std::memcpy(static_cast<uint8_t*>(pMap) + totalBytes, quantVal.data(), totalBytes);
+            D3D12_RANGE written{ 0, uploadBytes };
+            m_kvUploadBuffer->Unmap(0, &written);
+        }
 
-            ComPtr<ID3D12CommandAllocator> alloc;
-            if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE,
-                    IID_PPV_ARGS(&alloc)))) return false;
-            ComPtr<ID3D12GraphicsCommandList> list;
-            if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
-                    alloc.Get(), nullptr, IID_PPV_ARGS(&list)))) return false;
+        // Previous call's fence wait guarantees the GPU is done with this
+        // allocator, so resetting here is safe and keeps its memory bounded.
+        // Skip on the very first use: RDNA4 returns E_FAIL for Reset() on a
+        // fresh allocator (same workaround as the Notllama DX12 backend).
+        if (m_kvAllocUsed) {
+            if (FAILED(m_kvAlloc->Reset())) return false;
+        }
+        if (FAILED(m_kvCmdList->Reset(m_kvAlloc.Get(), nullptr))) return false;
 
-            D3D12_RESOURCE_BARRIER toCD = {};
-            toCD.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            toCD.Transition.pResource   = gpuBuf;
-            toCD.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            toCD.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
-            toCD.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            list->ResourceBarrier(1, &toCD);
+        // One command list covers K and V: barrier both to COPY_DEST, copy
+        // both, barrier both back to UAV, one submit, one fence wait.
+        ID3D12Resource* bufs[2]    = { m_keyBuffer.Get(), m_valueBuffer.Get() };
+        size_t          srcBase[2] = { 0, totalBytes };
 
+        D3D12_RESOURCE_BARRIER toCD[2] = {};
+        for (int i = 0; i < 2; ++i) {
+            toCD[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toCD[i].Transition.pResource   = bufs[i];
+            toCD[i].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            toCD[i].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+            toCD[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        m_kvCmdList->ResourceBarrier(2, toCD);
+
+        for (int i = 0; i < 2; ++i) {
             for (uint32_t h = 0; h < numHeads; ++h) {
-                size_t dstOffset = ((((size_t)batchIdx * m_config.NumLayers + layerIdx) * numHeads + h)
+                size_t dstOffset = (((batchIdx * m_config.NumLayers + layerIdx) * numHeads + h)
                                     * m_config.MaxSequenceLength + seqPos) * m_headStrideBytes;
-                size_t srcOffset = (size_t)h * m_headStrideBytes;
-                if (dstOffset + m_headStrideBytes > m_bufferSizeInBytes) {
-                    std::cerr << "[KVCache] WriteTokenKV: offset out of bounds at seqPos=" << seqPos << std::endl;
-                    return false;
-                }
-                list->CopyBufferRegion(gpuBuf, dstOffset, uploadBuf.Get(), srcOffset, m_headStrideBytes);
+                size_t srcOffset = srcBase[i] + (size_t)h * m_headStrideBytes;
+                if (dstOffset + m_headStrideBytes > m_bufferSizeInBytes) continue;
+                m_kvCmdList->CopyBufferRegion(bufs[i], dstOffset, m_kvUploadBuffer.Get(), srcOffset, m_headStrideBytes);
             }
+        }
 
-            D3D12_RESOURCE_BARRIER toUAV = {};
-            toUAV.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            toUAV.Transition.pResource   = gpuBuf;
-            toUAV.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-            toUAV.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            toUAV.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            list->ResourceBarrier(1, &toUAV);
+        D3D12_RESOURCE_BARRIER toUAV[2] = {};
+        for (int i = 0; i < 2; ++i) {
+            toUAV[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toUAV[i].Transition.pResource   = bufs[i];
+            toUAV[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            toUAV[i].Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            toUAV[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        m_kvCmdList->ResourceBarrier(2, toUAV);
 
-            list->Close();
+        if (FAILED(m_kvCmdList->Close())) return false;
 
-            ID3D12CommandList* ls[] = { list.Get() };
-            queue->ExecuteCommandLists(1, ls);
-
-            ComPtr<ID3D12Fence> fence;
-            device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-            queue->Signal(fence.Get(), 1);
-            if (fence->GetCompletedValue() < 1) {
-                fence->SetEventOnCompletion(1, fenceEvent);
-                WaitForSingleObject(fenceEvent, INFINITE);
+        ID3D12CommandList* ls[] = { m_kvCmdList.Get() };
+        queue->ExecuteCommandLists(1, ls);
+        m_kvAllocUsed = true;
+        queue->Signal(m_kvFence.Get(), ++m_kvFenceValue);
+        if (m_kvFence->GetCompletedValue() < m_kvFenceValue) {
+            m_kvFence->SetEventOnCompletion(m_kvFenceValue, m_kvFenceEvent);
+            if (WaitForSingleObject(m_kvFenceEvent, 10000) != WAIT_OBJECT_0) {
+                std::cerr << "[KVCache] Fence wait timed out - GPU queue stalled." << std::endl;
+                return false;
             }
-            return true;
-        };
-
-        if (!writeBuffer(quantKey.data(), m_keyBuffer.Get()))   return false;
-        if (!writeBuffer(quantVal.data(), m_valueBuffer.Get())) return false;
-
+        }
         return true;
     }
 
@@ -337,8 +375,16 @@ namespace DirectLLM {
     void KVCacheManager::Reset() {
         m_keyBuffer.Reset();
         m_valueBuffer.Reset();
+        m_kvAlloc.Reset();
+        m_kvCmdList.Reset();
+        m_kvUploadBuffer.Reset();
+        m_kvFence.Reset();
+        if (m_kvFenceEvent) { CloseHandle(m_kvFenceEvent); m_kvFenceEvent = nullptr; }
+        m_kvFenceValue = 0;
+        m_kvAllocUsed  = false;
         m_sequenceLengths.clear();
         m_bufferSizeInBytes = 0;
         m_headStrideBytes   = 0;
+        m_kvUploadBufferSize = 0;
     }
 }
